@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TestForge — Distributed Test Engine Dashboard</title>
+  <meta name="description" content="Real-time dashboard for the TestForge distributed test execution engine. Monitor jobs, workers, and system health." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #111118;
+      --bg-card: #16161f;
+      --bg-card-hover: #1c1c28;
+      --border: #2a2a3a;
+      --border-bright: #3a3a52;
+      --accent: #7c6af7;
+      --accent-glow: rgba(124, 106, 247, 0.3);
+      --accent-dim: rgba(124, 106, 247, 0.15);
+      --green: #22d37a;
+      --green-dim: rgba(34, 211, 122, 0.15);
+      --red: #f25c7e;
+      --red-dim: rgba(242, 92, 126, 0.15);
+      --yellow: #f5a623;
+      --yellow-dim: rgba(245, 166, 35, 0.15);
+      --blue: #4db8ff;
+      --blue-dim: rgba(77, 184, 255, 0.15);
+      --text-primary: #e8e8f0;
+      --text-secondary: #8888aa;
+      --text-dim: #55556a;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --shadow: 0 4px 24px rgba(0,0,0,0.5);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Topbar ─────────────────────────────── */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 32px;
+      height: 60px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(12px);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+    }
+
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, var(--accent), #a78bfa);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+
+    .nav-links { display: flex; gap: 8px; }
+    .nav-link {
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.2s;
+      border: none; background: none;
+    }
+    .nav-link:hover, .nav-link.active {
+      background: var(--accent-dim);
+      color: var(--accent);
+    }
+
+    .status-badge {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 12px; color: var(--text-secondary);
+    }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--red);
+      animation: pulse-dot 2s ease infinite;
+    }
+    .status-dot.online { background: var(--green); }
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* ── Layout ─────────────────────────────── */
+    .layout {
+      display: grid;
+      grid-template-columns: 240px 1fr;
+      min-height: calc(100vh - 60px);
+    }
+
+    .sidebar {
+      background: var(--bg-secondary);
+      border-right: 1px solid var(--border);
+      padding: 24px 16px;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+
+    .sidebar-section-label {
+      font-size: 10px; font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+      padding: 8px 12px 4px;
+    }
+
+    .sidebar-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      transition: all 0.15s;
+      border: none; background: none; width: 100%; text-align: left;
+    }
+    .sidebar-item:hover { background: var(--bg-card); color: var(--text-primary); }
+    .sidebar-item.active {
+      background: var(--accent-dim);
+      color: var(--accent);
+    }
+    .sidebar-item .icon { font-size: 15px; }
+
+    /* ── Main Content ────────────────────────── */
+    .main { padding: 28px 32px; overflow-y: auto; }
+
+    .page { display: none; }
+    .page.active { display: block; }
+
+    /* ── Page Header ─────────────────────────── */
+    .page-header {
+      display: flex; align-items: flex-end;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+    .page-title { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
+    .page-subtitle { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+
+    /* ── Cards ───────────────────────────────── */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      transition: all 0.2s;
+      position: relative;
+      overflow: hidden;
+    }
+    .stat-card:hover { border-color: var(--border-bright); transform: translateY(-1px); }
+    .stat-card::before {
+      content: '';
+      position: absolute; top: 0; left: 0; right: 0;
+      height: 2px;
+      background: var(--accent);
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    .stat-card:hover::before { opacity: 1; }
+
+    .stat-card.green::before { background: var(--green); }
+    .stat-card.red::before { background: var(--red); }
+    .stat-card.yellow::before { background: var(--yellow); }
+    .stat-card.blue::before { background: var(--blue); }
+
+    .stat-label {
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.8px;
+      color: var(--text-secondary);
+      margin-bottom: 12px;
+    }
+    .stat-value {
+      font-size: 36px; font-weight: 800;
+      letter-spacing: -1px;
+      transition: all 0.3s;
+    }
+    .stat-value.accent { color: var(--accent); }
+    .stat-value.green { color: var(--green); }
+    .stat-value.red { color: var(--red); }
+    .stat-value.yellow { color: var(--yellow); }
+    .stat-chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px; font-weight: 600;
+      margin-top: 8px;
+    }
+
+    /* ── Card Panel ──────────────────────────── */
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin-bottom: 20px;
+    }
+    .panel-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-title { font-size: 14px; font-weight: 600; }
+    .panel-body { padding: 20px; }
+
+    /* ── Buttons ─────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 13px; font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s;
+      border: 1px solid transparent;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+      box-shadow: 0 0 20px var(--accent-glow);
+    }
+    .btn-primary:hover { opacity: 0.85; transform: translateY(-1px); }
+    .btn-ghost {
+      background: transparent;
+      border-color: var(--border-bright);
+      color: var(--text-secondary);
+    }
+    .btn-ghost:hover { background: var(--bg-card-hover); color: var(--text-primary); }
+    .btn-danger { background: var(--red-dim); color: var(--red); border-color: var(--red); }
+    .btn-danger:hover { background: var(--red); color: white; }
+    .btn-sm { padding: 5px 10px; font-size: 12px; }
+
+    /* ── Table ───────────────────────────────── */
+    .table-container { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      text-align: left;
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.8px;
+      color: var(--text-secondary);
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 12px 16px;
+      font-size: 13px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--bg-card-hover); }
+
+    /* ── Status Badge ────────────────────────── */
+    .badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 11px; font-weight: 600;
+      text-transform: capitalize;
+    }
+    .badge::before {
+      content: '';
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .badge-completed { background: var(--green-dim); color: var(--green); }
+    .badge-failed { background: var(--red-dim); color: var(--red); }
+    .badge-active, .badge-running { background: var(--accent-dim); color: var(--accent); animation: badge-pulse 1.5s ease infinite; }
+    .badge-pending, .badge-waiting { background: var(--yellow-dim); color: var(--yellow); }
+    .badge-cancelled { background: rgba(100,100,120,0.2); color: var(--text-secondary); }
+    @keyframes badge-pulse { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
+
+    /* ── Code / Log Panel ────────────────────── */
+    .log-panel {
+      background: #0d0d14;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      line-height: 1.7;
+      max-height: 360px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #c8c8e0;
+    }
+    .log-line-stdout { color: #c8c8e0; }
+    .log-line-stderr { color: var(--red); }
+    .log-line-info { color: var(--blue); }
+    .log-ts { color: var(--text-dim); margin-right: 8px; }
+
+    /* ── Submit Form ─────────────────────────── */
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+    input, textarea, select {
+      width: 100%;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      font-family: inherit;
+      color: var(--text-primary);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+    textarea { font-family: 'JetBrains Mono', monospace; font-size: 12px; resize: vertical; }
+
+    /* ── Progress Bar ────────────────────────── */
+    .progress-wrap { background: var(--border); border-radius: 4px; height: 4px; overflow: hidden; }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), #a78bfa);
+      border-radius: 4px;
+      transition: width 0.4s ease;
+    }
+
+    /* ── Health Checks ───────────────────────── */
+    .health-grid { display: flex; flex-direction: column; gap: 10px; }
+    .health-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 16px;
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+    .health-row-label { font-size: 13px; font-weight: 500; }
+    .health-ok { color: var(--green); font-size: 12px; font-weight: 600; }
+    .health-fail { color: var(--red); font-size: 12px; font-weight: 600; }
+
+    /* ── Animations ──────────────────────────── */
+    .fade-in { animation: fadeIn 0.3s ease; }
+    @keyframes fadeIn { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform: translateY(0); } }
+
+    .shimmer {
+      background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-card-hover) 50%, var(--bg-card) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+    }
+    @keyframes shimmer { 0% { background-position:200% 0; } 100% { background-position:-200% 0; } }
+
+    /* ── Empty State ─────────────────────────── */
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-secondary);
+    }
+    .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+    .empty-state h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; color: var(--text-primary); }
+    .empty-state p { font-size: 13px; }
+
+    /* ── Toast ───────────────────────────────── */
+    #toast-container {
+      position: fixed; bottom: 24px; right: 24px;
+      display: flex; flex-direction: column; gap: 8px;
+      z-index: 999;
+    }
+    .toast {
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      animation: slideIn 0.3s ease, fadeOut 0.3s ease 2.7s forwards;
+      backdrop-filter: blur(12px);
+      max-width: 320px;
+    }
+    .toast-success { background: var(--green-dim); border: 1px solid var(--green); color: var(--green); }
+    .toast-error { background: var(--red-dim); border: 1px solid var(--red); color: var(--red); }
+    .toast-info { background: var(--accent-dim); border: 1px solid var(--accent); color: var(--accent); }
+    @keyframes slideIn { from { transform: translateX(100%); opacity:0; } to { transform:none; opacity:1; } }
+    @keyframes fadeOut { to { opacity:0; transform: translateX(100%); } }
+
+    /* ── Scrollbar ───────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- ── Topbar ──────────────────────────────────────────────────────────────── -->
+<header class="topbar">
+  <div class="logo">
+    <div class="logo-icon">⚡</div>
+    TestForge
+  </div>
+  <nav class="nav-links">
+    <button class="nav-link active" onclick="showPage('overview')">Overview</button>
+    <button class="nav-link" onclick="showPage('jobs')">Jobs</button>
+    <button class="nav-link" onclick="showPage('submit')">Submit Test</button>
+    <button class="nav-link" onclick="showPage('health')">Health</button>
+  </nav>
+  <div class="status-badge">
+    <div class="status-dot" id="connection-dot"></div>
+    <span id="connection-label">Connecting...</span>
+  </div>
+</header>
+
+<div class="layout">
+  <!-- ── Sidebar ─────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="sidebar-section-label">Navigation</div>
+    <button class="sidebar-item active" id="sb-overview" onclick="showPage('overview')">
+      <span class="icon">📊</span> Overview
+    </button>
+    <button class="sidebar-item" id="sb-jobs" onclick="showPage('jobs')">
+      <span class="icon">📋</span> Job History
+    </button>
+    <button class="sidebar-item" id="sb-submit" onclick="showPage('submit')">
+      <span class="icon">🚀</span> Submit Test
+    </button>
+    <button class="sidebar-item" id="sb-live" onclick="showPage('live')">
+      <span class="icon">📡</span> Live Stream
+    </button>
+    <div class="sidebar-section-label" style="margin-top:16px">System</div>
+    <button class="sidebar-item" id="sb-health" onclick="showPage('health')">
+      <span class="icon">💚</span> Health
+    </button>
+    <button class="sidebar-item" id="sb-queue" onclick="showPage('queue')">
+      <span class="icon">⚙️</span> Queue Control
+    </button>
+  </aside>
+
+  <!-- ── Main ───────────────────────────────── -->
+  <main class="main">
+
+    <!-- ── OVERVIEW ─────────────────────────── -->
+    <section class="page active fade-in" id="page-overview">
+      <div class="page-header">
+        <div>
+          <div class="page-title">Overview</div>
+          <div class="page-subtitle">Real-time view of your distributed test execution engine</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="refreshAll()">↺ Refresh</button>
+      </div>
+
+      <div class="stat-grid">
+        <div class="stat-card blue">
+          <div class="stat-label">Waiting</div>
+          <div class="stat-value accent" id="stat-waiting">—</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:6px">Jobs in queue</div>
+        </div>
+        <div class="stat-card accent">
+          <div class="stat-label">Running</div>
+          <div class="stat-value accent" id="stat-active">—</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:6px">Jobs executing now</div>
+        </div>
+        <div class="stat-card green">
+          <div class="stat-label">Completed</div>
+          <div class="stat-value green" id="stat-completed">—</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:6px">All time</div>
+        </div>
+        <div class="stat-card red">
+          <div class="stat-label">Failed</div>
+          <div class="stat-value red" id="stat-failed">—</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:6px">All time</div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Workers</span>
+            <span id="worker-total-label" style="font-size:12px;color:var(--text-secondary)">—</span>
+          </div>
+          <div class="panel-body">
+            <div style="margin-bottom:8px;display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary)">
+              <span>Active</span><span id="w-active">—</span>
+            </div>
+            <div class="progress-wrap" style="margin-bottom:16px">
+              <div class="progress-fill" id="w-active-bar" style="width:0%"></div>
+            </div>
+            <div style="margin-bottom:8px;display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary)">
+              <span>Avg Duration</span><span id="w-avg-dur">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-secondary)">
+              <span>Total Completed</span><span id="w-completed">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">System</span>
+          </div>
+          <div class="panel-body">
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:12px">
+              <span style="color:var(--text-secondary)">Uptime</span>
+              <span id="sys-uptime" style="font-family:'JetBrains Mono',monospace">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:12px">
+              <span style="color:var(--text-secondary)">Memory (RSS)</span>
+              <span id="sys-mem" style="font-family:'JetBrains Mono',monospace">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:12px">
+              <span style="color:var(--text-secondary)">CPU Load (1m)</span>
+              <span id="sys-load" style="font-family:'JetBrains Mono',monospace">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:12px">
+              <span style="color:var(--text-secondary)">Engine Version</span>
+              <span id="sys-version" style="font-family:'JetBrains Mono',monospace">—</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── JOBS ─────────────────────────────── -->
+    <section class="page fade-in" id="page-jobs">
+      <div class="page-header">
+        <div>
+          <div class="page-title">Job History</div>
+          <div class="page-subtitle">Browse past test executions</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-body" style="padding:0">
+          <div class="table-container">
+            <table id="jobs-table">
+              <thead>
+                <tr>
+                  <th>Job ID</th>
+                  <th>Status</th>
+                  <th>Duration</th>
+                  <th>Exit Code</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-tbody">
+                <tr><td colspan="5"><div class="empty-state"><div class="icon">📋</div><h3>No jobs stored</h3><p>Submit a test to see it here</p></div></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── SUBMIT ────────────────────────────── -->
+    <section class="page fade-in" id="page-submit">
+      <div class="page-header">
+        <div>
+          <div class="page-title">Submit Test Job</div>
+          <div class="page-subtitle">Run a command or shell script on the distributed engine</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start;">
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Job Configuration</span></div>
+          <div class="panel-body">
+            <div class="form-group">
+              <label>Type</label>
+              <select id="job-type" onchange="toggleJobType()">
+                <option value="script">Shell Script</option>
+                <option value="command">Command</option>
+              </select>
+            </div>
+            <div class="form-group" id="script-group">
+              <label>Shell Script</label>
+              <textarea id="job-script" rows="8" placeholder="#!/bin/bash&#10;echo 'Running tests...'&#10;node -e 'console.log(&quot;Test passed!&quot;)'"></textarea>
+            </div>
+            <div class="form-group" id="command-group" style="display:none">
+              <label>Command</label>
+              <input id="job-command" type="text" placeholder="node" />
+              <label style="margin-top:12px">Arguments (space-separated)</label>
+              <input id="job-args" type="text" placeholder="-e 'console.log(1)'" />
+            </div>
+            <div class="form-group">
+              <label>Timeout (ms)</label>
+              <input id="job-timeout" type="number" value="30000" />
+            </div>
+            <div class="form-group">
+              <label>Metadata (JSON, optional)</label>
+              <input id="job-metadata" type="text" placeholder='{"project": "my-app"}' />
+            </div>
+            <button class="btn btn-primary" style="width:100%" onclick="submitJob()">🚀 Submit Test</button>
+          </div>
+        </div>
+        <div>
+          <div class="panel" id="submit-result" style="display:none">
+            <div class="panel-header"><span class="panel-title">Submission Result</span></div>
+            <div class="panel-body">
+              <div id="submit-result-body"></div>
+            </div>
+          </div>
+          <div class="panel" style="margin-top:16px">
+            <div class="panel-header"><span class="panel-title">Quick Examples</span></div>
+            <div class="panel-body" style="display:flex;flex-direction:column;gap:8px">
+              <button class="btn btn-ghost btn-sm" onclick="loadExample('bash')">📝 Bash Script</button>
+              <button class="btn btn-ghost btn-sm" onclick="loadExample('node')">🟢 Node.js</button>
+              <button class="btn btn-ghost btn-sm" onclick="loadExample('python')">🐍 Python</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── LIVE STREAM ───────────────────────── -->
+    <section class="page fade-in" id="page-live">
+      <div class="page-header">
+        <div>
+          <div class="page-title">Live Stream</div>
+          <div class="page-subtitle">Real-time output from the engine via WebSocket</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="clearLiveLog()">Clear</button>
+      </div>
+      <div class="panel" style="margin-bottom:16px">
+        <div class="panel-body">
+          <div style="display:flex;gap:10px">
+            <input id="live-job-id" type="text" placeholder="Enter Job ID to subscribe..." style="flex:1" />
+            <button class="btn btn-primary" onclick="subscribeJob()">Subscribe</button>
+          </div>
+        </div>
+      </div>
+      <div class="log-panel" id="live-log">
+        <span class="log-line-info">Waiting for subscription...</span>
+      </div>
+    </section>
+
+    <!-- ── HEALTH ────────────────────────────── -->
+    <section class="page fade-in" id="page-health">
+      <div class="page-header">
+        <div>
+          <div class="page-title">System Health</div>
+          <div class="page-subtitle">Live health checks for all engine components</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="fetchHealth()">↺ Refresh</button>
+      </div>
+      <div class="stat-grid" style="grid-template-columns:1fr 1fr 1fr">
+        <div class="stat-card">
+          <div class="stat-label">Redis</div>
+          <div class="stat-value" id="h-redis">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Queue</div>
+          <div class="stat-value" id="h-queue">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Workers</div>
+          <div class="stat-value" id="h-workers">—</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Component Checks</span></div>
+        <div class="panel-body">
+          <div class="health-grid" id="health-grid">
+            <div class="shimmer" style="height:44px;border-radius:8px"></div>
+            <div class="shimmer" style="height:44px;border-radius:8px"></div>
+            <div class="shimmer" style="height:44px;border-radius:8px"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── QUEUE CONTROL ─────────────────────── -->
+    <section class="page fade-in" id="page-queue">
+      <div class="page-header">
+        <div>
+          <div class="page-title">Queue Control</div>
+          <div class="page-subtitle">Manage the test execution queue</div>
+        </div>
+      </div>
+      <div class="panel" style="max-width:400px">
+        <div class="panel-header"><span class="panel-title">Actions</span></div>
+        <div class="panel-body" style="display:flex;flex-direction:column;gap:12px">
+          <button class="btn btn-ghost" style="width:100%" onclick="queueAction('pause')">⏸ Pause Queue</button>
+          <button class="btn btn-ghost" style="width:100%" onclick="queueAction('resume')">▶️ Resume Queue</button>
+          <button class="btn btn-danger" style="width:100%" onclick="queueAction('clear')">🗑 Clear Queue</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="toast-container"></div>
+
+<script>
+const API = '/api/v1';
+const socket = io();
+let subscribedJob = null;
+
+// ── Connection ────────────────────────────────────────────────────────────────
+socket.on('connect', () => {
+  document.getElementById('connection-dot').classList.add('online');
+  document.getElementById('connection-label').textContent = 'Connected';
+  appendLiveLog('info', 'WebSocket connected');
+});
+socket.on('disconnect', () => {
+  document.getElementById('connection-dot').classList.remove('online');
+  document.getElementById('connection-label').textContent = 'Disconnected';
+});
+
+// ── WebSocket events ──────────────────────────────────────────────────────────
+socket.on('job-state', ({ jobId, status, result }) => {
+  appendLiveLog('info', `[${jobId}] Current state: ${status}`);
+  if (result?.stdout) appendLiveLog('stdout', result.stdout);
+});
+socket.on('job-completed', ({ jobId }) => {
+  appendLiveLog('info', `[${jobId}] ✅ Completed`);
+  toast('Job completed!', 'success');
+  refreshAll();
+});
+socket.on('job-failed', ({ jobId, error }) => {
+  appendLiveLog('stderr', `[${jobId}] ❌ Failed: ${error}`);
+  toast(`Job failed: ${error}`, 'error');
+});
+socket.on('job-progress', ({ jobId, progress }) => {
+  appendLiveLog('info', `[${jobId}] Progress: ${JSON.stringify(progress)}`);
+});
+
+// ── Page Navigation ───────────────────────────────────────────────────────────
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-link, .sidebar-item').forEach(b => b.classList.remove('active'));
+  document.getElementById('page-' + name)?.classList.add('active');
+  document.getElementById('sb-' + name)?.classList.add('active');
+  document.querySelectorAll('.nav-link').forEach(b => {
+    if (b.textContent.toLowerCase().includes(name)) b.classList.add('active');
+  });
+  if (name === 'overview') refreshAll();
+  if (name === 'health') fetchHealth();
+  if (name === 'jobs') fetchJobs();
+}
+
+// ── Stats Refresh ─────────────────────────────────────────────────────────────
+async function refreshAll() {
+  try {
+    const [qRes, mRes] = await Promise.all([
+      fetch(`${API}/queue/stats`).then(r => r.json()),
+      fetch(`${API}/metrics`).then(r => r.json()),
+    ]);
+    const q = qRes.data?.queue || {};
+    const w = qRes.data?.workers || {};
+    const sys = mRes.data || {};
+
+    setText('stat-waiting', q.waiting ?? '—');
+    setText('stat-active', q.active ?? '—');
+    setText('stat-completed', q.completed ?? '—');
+    setText('stat-failed', q.failed ?? '—');
+
+    setText('w-active', `${w.active ?? '—'} / ${w.total ?? '—'}`);
+    setText('worker-total-label', `${w.total ?? '—'} total workers`);
+    setText('w-avg-dur', w.averageExecutionTime ? `${Math.round(w.averageExecutionTime)}ms` : '—');
+    setText('w-completed', w.completed ?? '—');
+    const pct = w.total ? Math.round((w.active / w.total) * 100) : 0;
+    document.getElementById('w-active-bar').style.width = pct + '%';
+
+    if (sys.uptime) setText('sys-uptime', formatUptime(sys.uptime));
+    if (sys.memory?.rss) setText('sys-mem', `${(sys.memory.rss/1024/1024).toFixed(1)} MB`);
+    if (sys.cpu?.loadAverage) setText('sys-load', sys.cpu.loadAverage[0].toFixed(2));
+  } catch(e) {}
+}
+
+// ── Jobs Table ────────────────────────────────────────────────────────────────
+const jobCache = {};
+async function fetchJobs() {
+  const tbody = document.getElementById('jobs-tbody');
+  if (!Object.keys(jobCache).length) {
+    tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state"><div class="icon">📋</div><h3>No job history</h3><p>Completed job results will appear here</p></div></td></tr>';
+    return;
+  }
+  const rows = Object.values(jobCache).map(j => `
+    <tr>
+      <td><span style="font-family:'JetBrains Mono',monospace;font-size:11px">${j.jobId?.substring(0,8)}...</span></td>
+      <td><span class="badge badge-${j.status}">${j.status}</span></td>
+      <td>${j.duration ? j.duration + 'ms' : '—'}</td>
+      <td>${j.exitCode ?? '—'}</td>
+      <td style="display:flex;gap:6px">
+        <button class="btn btn-ghost btn-sm" onclick="viewJobLogs('${j.jobId}')">Logs</button>
+        ${j.status === 'failed' ? `<button class="btn btn-ghost btn-sm" onclick="retryJob('${j.jobId}')">Retry</button>` : ''}
+      </td>
+    </tr>
+  `).join('');
+  tbody.innerHTML = rows;
+}
+
+async function viewJobLogs(jobId) {
+  showPage('live');
+  document.getElementById('live-job-id').value = jobId;
+  subscribeJob(jobId);
+}
+
+async function retryJob(jobId) {
+  await fetch(`${API}/jobs/${jobId}/retry`, { method: 'POST' });
+  toast('Job queued for retry', 'info');
+}
+
+// ── Submit ────────────────────────────────────────────────────────────────────
+function toggleJobType() {
+  const t = document.getElementById('job-type').value;
+  document.getElementById('script-group').style.display = t === 'script' ? 'block' : 'none';
+  document.getElementById('command-group').style.display = t === 'command' ? 'block' : 'none';
+}
+
+function loadExample(type) {
+  document.getElementById('job-type').value = type === 'bash' ? 'script' : 'command';
+  toggleJobType();
+  if (type === 'bash') {
+    document.getElementById('job-script').value = '#!/bin/bash\necho "Hello from TestForge!"\ndate\necho "Done."';
+  } else if (type === 'node') {
+    document.getElementById('job-type').value = 'command';
+    toggleJobType();
+    document.getElementById('job-command').value = 'node';
+    document.getElementById('job-args').value = '-e "console.log(\'Node.js test passed!\')"';
+  } else {
+    document.getElementById('job-type').value = 'command';
+    toggleJobType();
+    document.getElementById('job-command').value = 'python3';
+    document.getElementById('job-args').value = '-c "print(\'Python test passed!\')"';
+  }
+}
+
+async function submitJob() {
+  const type = document.getElementById('job-type').value;
+  const payload = {
+    timeout: parseInt(document.getElementById('job-timeout').value) || 30000,
+  };
+  try {
+    const meta = document.getElementById('job-metadata').value.trim();
+    if (meta) payload.metadata = JSON.parse(meta);
+  } catch { toast('Invalid JSON in metadata', 'error'); return; }
+
+  if (type === 'script') {
+    payload.script = document.getElementById('job-script').value;
+    if (!payload.script.trim()) { toast('Script cannot be empty', 'error'); return; }
+  } else {
+    payload.command = document.getElementById('job-command').value.trim();
+    const argsStr = document.getElementById('job-args').value.trim();
+    payload.args = argsStr ? argsStr.split(/\s+/) : [];
+    if (!payload.command) { toast('Command cannot be empty', 'error'); return; }
+  }
+
+  try {
+    const res = await fetch(`${API}/submit-test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error);
+
+    const jobId = data.data.jobId;
+    jobCache[jobId] = { jobId, status: 'pending' };
+
+    document.getElementById('submit-result').style.display = 'block';
+    document.getElementById('submit-result-body').innerHTML = `
+      <div style="background:var(--green-dim);border:1px solid var(--green);border-radius:8px;padding:12px;margin-bottom:12px">
+        ✅ <strong>Job submitted!</strong>
+      </div>
+      <div style="font-size:12px;margin-bottom:6px;color:var(--text-secondary)">Job ID</div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg-secondary);padding:8px 12px;border-radius:6px;margin-bottom:12px">${jobId}</div>
+      <div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">Queue position: ${data.data.queuePosition}</div>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('live-job-id').value='${jobId}';showPage('live');subscribeJob()">📡 Watch Live</button>
+    `;
+    toast('Job submitted!', 'success');
+    socket.emit('subscribe-job', jobId);
+  } catch (e) {
+    toast(`Submit failed: ${e.message}`, 'error');
+  }
+}
+
+// ── Live Stream ───────────────────────────────────────────────────────────────
+function subscribeJob(jobId) {
+  const id = jobId || document.getElementById('live-job-id').value.trim();
+  if (!id) { toast('Enter a Job ID', 'error'); return; }
+  if (subscribedJob) socket.emit('unsubscribe-job', subscribedJob);
+  subscribedJob = id;
+  socket.emit('subscribe-job', id);
+  appendLiveLog('info', `Subscribed to job: ${id}`);
+}
+
+function appendLiveLog(type, text) {
+  const panel = document.getElementById('live-log');
+  const ts = new Date().toLocaleTimeString();
+  const line = document.createElement('div');
+  line.className = `log-line-${type}`;
+  line.innerHTML = `<span class="log-ts">${ts}</span>${escapeHtml(text)}`;
+  panel.appendChild(line);
+  panel.scrollTop = panel.scrollHeight;
+  if (panel.children.length > 500) panel.removeChild(panel.firstChild);
+}
+
+function clearLiveLog() {
+  document.getElementById('live-log').innerHTML = '<span class="log-line-info">Log cleared.</span>';
+}
+
+// ── Health ────────────────────────────────────────────────────────────────────
+async function fetchHealth() {
+  try {
+    const res = await fetch(`${API}/health`);
+    const data = await res.json();
+    const h = data.data;
+    const checks = h?.checks || {};
+    const all = h?.status === 'healthy';
+
+    const icon = v => v ? '✅' : '❌';
+    const cls = v => v ? 'green' : 'red';
+
+    setText('h-redis', icon(checks.redis));
+    setText('h-queue', icon(checks.queue));
+    setText('h-workers', icon(checks.workers));
+
+    document.getElementById(`h-redis`).className = `stat-value ${cls(checks.redis)}`;
+    document.getElementById(`h-queue`).className = `stat-value ${cls(checks.queue)}`;
+    document.getElementById(`h-workers`).className = `stat-value ${cls(checks.workers)}`;
+
+    const grid = document.getElementById('health-grid');
+    grid.innerHTML = Object.entries(checks).map(([k, v]) => `
+      <div class="health-row">
+        <span class="health-row-label">${k.charAt(0).toUpperCase() + k.slice(1)}</span>
+        <span class="${v ? 'health-ok' : 'health-fail'}">${v ? '● Operational' : '● Down'}</span>
+      </div>
+    `).join('') + `
+      <div class="health-row" style="border-color:${all ? 'var(--green)' : 'var(--red)'}">
+        <span class="health-row-label" style="font-weight:700">Overall System</span>
+        <span class="${all ? 'health-ok' : 'health-fail'}" style="font-size:14px">${all ? '● Healthy' : '● Degraded'}</span>
+      </div>
+    `;
+  } catch(e) {
+    toast('Health check failed', 'error');
+  }
+}
+
+// ── Queue Control ─────────────────────────────────────────────────────────────
+async function queueAction(action) {
+  const methods = { pause: 'POST', resume: 'POST', clear: 'DELETE' };
+  const endpoints = { pause: '/queue/pause', resume: '/queue/resume', clear: '/queue/clear' };
+  try {
+    const res = await fetch(API + endpoints[action], { method: methods[action] });
+    const data = await res.json();
+    if (data.success) toast(data.message || `Queue ${action} successful`, 'success');
+    else throw new Error(data.error);
+  } catch(e) { toast(`Queue action failed: ${e.message}`, 'error'); }
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+function escapeHtml(t) {
+  return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function formatUptime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
+  return `${h}h ${m}m ${sec}s`;
+}
+function toast(msg, type = 'info') {
+  const c = document.getElementById('toast-container');
+  const t = document.createElement('div');
+  t.className = `toast toast-${type}`;
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+// ── Auto-refresh ──────────────────────────────────────────────────────────────
+setInterval(() => {
+  if (document.getElementById('page-overview')?.classList.contains('active')) {
+    refreshAll();
+  }
+}, 5000);
+
+// Init
+refreshAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,148 @@
+{
+  "title": "TestForge - Distributed Test Engine",
+  "uid": "testforge-main",
+  "schemaVersion": 39,
+  "tags": ["testforge"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Jobs Submitted (total)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "options": { "colorMode": "background", "graphMode": "area" },
+      "targets": [{ "expr": "forge_jobs_submitted_total", "legendFormat": "Submitted" }]
+    },
+    {
+      "id": 2,
+      "title": "Jobs Completed",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "options": { "colorMode": "background", "graphMode": "area" },
+      "targets": [{ "expr": "sum(forge_jobs_completed_total{status='completed'})", "legendFormat": "Completed" }]
+    },
+    {
+      "id": 9,
+      "title": "Jobs Failed",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "red", "value": 1 }] }
+      },
+      "targets": [{ "expr": "sum(forge_jobs_completed_total{status='failed'})", "legendFormat": "Failed" }]
+    },
+    {
+      "id": 3,
+      "title": "Active Workers",
+      "type": "gauge",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["last"] },
+        "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 8 }, { "color": "red", "value": 10 }] }
+      },
+      "targets": [{ "expr": "forge_workers_active", "legendFormat": "Active" }]
+    },
+    {
+      "id": 4,
+      "title": "Queue Waiting",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 4, "w": 6, "h": 4 },
+      "targets": [{ "expr": "forge_queue_waiting", "legendFormat": "Waiting" }]
+    },
+    {
+      "id": 10,
+      "title": "Queue Active",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 4, "w": 6, "h": 4 },
+      "targets": [{ "expr": "forge_queue_active", "legendFormat": "Active" }]
+    },
+    {
+      "id": 11,
+      "title": "Queue Failed",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 4, "w": 6, "h": 4 },
+      "options": {
+        "colorMode": "background",
+        "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "red", "value": 1 }] }
+      },
+      "targets": [{ "expr": "forge_queue_failed", "legendFormat": "Failed" }]
+    },
+    {
+      "id": 12,
+      "title": "Workers Idle",
+      "type": "stat",
+      "gridPos": { "x": 18, "y": 4, "w": 6, "h": 4 },
+      "targets": [{ "expr": "forge_workers_idle", "legendFormat": "Idle" }]
+    },
+    {
+      "id": 5,
+      "title": "Job Duration Distribution (ms)",
+      "type": "histogram",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "expr": "rate(forge_job_duration_ms_bucket[5m])", "legendFormat": "{{le}}ms" }]
+    },
+    {
+      "id": 6,
+      "title": "Jobs Completed Rate by Status",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "expr": "rate(forge_jobs_completed_total[1m])", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 7,
+      "title": "Node.js Memory Usage (bytes)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "process_resident_memory_bytes{app=\"distributed-test-engine\"}",
+          "legendFormat": "RSS"
+        },
+        {
+          "expr": "nodejs_heap_size_used_bytes{app=\"distributed-test-engine\"}",
+          "legendFormat": "Heap Used"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Node.js Event Loop Lag (ms)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "nodejs_eventloop_lag_seconds{app=\"distributed-test-engine\"} * 1000",
+          "legendFormat": "Event Loop Lag"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Average Job Duration (ms)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(forge_job_duration_ms_sum[5m]) / rate(forge_job_duration_ms_count[5m])",
+          "legendFormat": "Avg Duration ({{status}})"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Job Submission Rate",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(forge_jobs_submitted_total[1m])",
+          "legendFormat": "Submissions/min"
+        }
+      ]
+    }
+  ]
+}
