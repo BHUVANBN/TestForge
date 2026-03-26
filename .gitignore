@@ -39,3 +39,4 @@ coverage/
 docker_data/
 docker/grafana/data/
 docker/prometheus/data/
+dump.rdb
