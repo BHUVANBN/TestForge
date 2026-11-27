@@ -1,67 +1,116 @@
-import APIServer from './api';
-import { logger } from './utils/logger';
-import fs from 'fs/promises';
-
-
-async function ensureDirectories(): Promise<void> {
-  const directories = [
-    './logs',
-    './logs/jobs',
-    './temp'
-  ];
-
-  for (const dir of directories) {
-    try {
-      await fs.access(dir);
-    } catch {
-      await fs.mkdir(dir, { recursive: true });
-      logger.info(`Created directory: ${dir}`);
-    }
-  }
-}
+import type { Server } from 'http';
+import config, { loadConfig, setConfig } from './config';
+import { createLogger } from './utils/logger';
 
 async function main(): Promise<void> {
+  // Validate configuration first so misconfiguration fails fast with a clear message.
   try {
-    logger.info('Starting Distributed Test Execution Engine');
-    
-    // Ensure necessary directories exist
-    await ensureDirectories();
-    
-    const mode = process.env.ENGINE_MODE || 'hybrid'; // 'api', 'worker', or 'hybrid'
-    
-    if (mode === 'api' || mode === 'hybrid') {
-      logger.info('Starting API Server...');
-      const server = new APIServer();
-      await server.start();
-    }
-    
-    if (mode === 'worker' || mode === 'hybrid') {
-      logger.info('Starting Worker Manager...');
-      // WorkerManager is instantiated in APIServer and QueueManager usually, 
-      // but in standalone worker mode we need to make sure it's active.
-      const WorkerManager = (await import('./workers/manager')).default;
-      WorkerManager.getInstance();
-    }
-    
-    logger.info(`Distributed Test Execution Engine started in ${mode} mode`);
-    
-  } catch (error) {
-    const err = error instanceof Error ? error : new Error(String(error));
-    logger.error('Failed to start application', { error: err.message });
-    process.exit(1);
+    setConfig(loadConfig());
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(78); // EX_CONFIG
   }
+
+  const log = createLogger('main');
+  const { waitForRedis, closeAllRedis, redisHealthy } = await import('./queue/redis');
+  const { startMetricsServer } = await import('./metricsServer');
+
+  const mode = config.mode;
+  const runApi = mode === 'api' || mode === 'hybrid';
+  const runWorker = mode === 'worker' || mode === 'hybrid';
+  log.info('Starting TestForge', { mode, executor: runWorker ? config.workers.executor : undefined });
+
+  await waitForRedis();
+
+  const { historyEnabled, getHistory } = await import('./history');
+  if (historyEnabled()) {
+    // Postgres may still be starting; retry for up to ~30s before giving up.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await getHistory()!.migrate();
+        break;
+      } catch (err) {
+        if (attempt >= 15) throw new Error(`Job history database unreachable: ${(err as Error).message}`);
+        log.warn('Waiting for history database', { attempt, error: (err as Error).message });
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    log.info('Job history enabled (Postgres)');
+  }
+
+  let api: import('./api').APIServer | null = null;
+  let worker: import('./workers/manager').WorkerManager | null = null;
+  let metrics: Server | null = null;
+
+  if (runWorker) {
+    if (config.workers.executor === 'docker') {
+      const { dockerAvailable } = await import('./workers/dockerExecutor');
+      if (!(await dockerAvailable())) {
+        throw new Error(
+          `Docker is not reachable at ${config.docker.socketPath}. Mount the Docker socket into the worker, ` +
+            'or set WORKER_EXECUTOR=local for local development.'
+        );
+      }
+    }
+    const { WorkerManager } = await import('./workers/manager');
+    worker = new WorkerManager();
+    await worker.start();
+  }
+
+  if (runApi) {
+    const { APIServer } = await import('./api');
+    api = new APIServer();
+    await api.start();
+  }
+
+  if (config.metrics.enabled) {
+    metrics = startMetricsServer({
+      sampleQueue: runApi,
+      health: async () => (await redisHealthy()) && (!worker || worker.isRunning()),
+    });
+  }
+
+  let shuttingDown = false;
+  const shutdown = async (reason: string, code = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info('Shutting down', { reason });
+    const hardDeadline = setTimeout(() => {
+      log.error('Shutdown did not finish in time; forcing exit');
+      process.exit(1);
+    }, config.workers.shutdownTimeoutMs + 15_000);
+    hardDeadline.unref();
+    try {
+      await api?.close();
+      await worker?.close();
+      await new Promise<void>((r) => (metrics ? metrics.close(() => r()) : r()));
+      const QueueManager = (await import('./queue/manager')).default;
+      await QueueManager.getInstance().close().catch(() => undefined);
+      await (await import('./webhooks')).closeWebhookQueue().catch(() => undefined);
+      await (await import('./history')).closeHistory().catch(() => undefined);
+      await closeAllRedis();
+      log.info('Shutdown complete');
+    } catch (err) {
+      log.error('Error during shutdown', { error: err instanceof Error ? err.message : String(err) });
+      code = code || 1;
+    }
+    process.exit(code);
+  };
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('uncaughtException', (err) => {
+    log.error('Uncaught exception', { error: err.message, stack: err.stack });
+    void shutdown('uncaughtException', 1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    log.error('Unhandled promise rejection', { reason: reason instanceof Error ? reason.stack : String(reason) });
+  });
+
+  log.info(`TestForge started in ${mode} mode`);
 }
 
-// Handle top-level errors
-process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception', { error: error.message, stack: error.stack });
+main().catch((err) => {
+  console.error('Failed to start TestForge:', err instanceof Error ? err.message : err);
   process.exit(1);
 });
-
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Promise Rejection', { reason, promise });
-  process.exit(1);
-});
-
-// Start the application
-main();

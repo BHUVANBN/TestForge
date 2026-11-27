@@ -1,45 +1,101 @@
-import { Request, Response, NextFunction } from 'express';
+import { createHash, timingSafeEqual } from 'crypto';
+import { NextFunction, Request, Response } from 'express';
 import config from '../../config';
-import { logger } from '../../utils/logger';
+import { createLogger } from '../../utils/logger';
+import { Principal } from '../../utils/types';
+
+declare module 'express-serve-static-core' {
+  interface Request {
+    principal?: Principal;
+  }
+}
+
+const log = createLogger('auth');
+
+/** Used when auth is disabled (local development only). */
+export const ANONYMOUS: Principal = Object.freeze({ id: 'anonymous', admin: true });
+
+const digest = (key: string): Buffer => createHash('sha256').update(key).digest();
+
+interface KeyEntry {
+  digest: Buffer;
+  principal: Principal;
+}
+
+let table: { source: string; entries: KeyEntry[] } | null = null;
+
+function keyTable(): KeyEntry[] {
+  const source = JSON.stringify([config.auth.apiKeys, config.auth.adminApiKeys]);
+  if (table?.source !== source) {
+    const make = (key: string, admin: boolean): KeyEntry => {
+      const d = digest(key);
+      // Stable, non-reversible identity for job ownership. Never log raw keys.
+      return { digest: d, principal: { id: `key_${d.toString('hex').slice(0, 16)}`, admin } };
+    };
+    table = {
+      source,
+      entries: [
+        ...config.auth.adminApiKeys.map((k) => make(k, true)),
+        ...config.auth.apiKeys.map((k) => make(k, false)),
+      ],
+    };
+  }
+  return table.entries;
+}
+
+/** Resolve an API key to a principal using constant-time comparison. */
+export function principalForKey(key: string | undefined | null): Principal | null {
+  if (!config.auth.enabled) return ANONYMOUS;
+  if (!key) return null;
+  const d = digest(key);
+  let match: Principal | null = null;
+  for (const entry of keyTable()) {
+    // Compare against every entry so timing doesn't reveal which matched.
+    if (timingSafeEqual(entry.digest, d) && !match) match = entry.principal;
+  }
+  return match;
+}
+
+export function extractKey(req: Request): string | undefined {
+  const header = req.headers['x-api-key'];
+  if (typeof header === 'string' && header) return header;
+  const auth = req.headers.authorization;
+  if (auth?.startsWith('Bearer ')) return auth.slice(7).trim();
+  return undefined;
+}
 
 /**
- * API Key authentication middleware.
- * When API_AUTH_ENABLED=true, every request must carry one of the configured
- * API keys in the `X-API-Key` header or the `api_key` query parameter.
- * The health endpoint is always exempted so monitoring tools work without keys.
+ * API key authentication. Keys are accepted only in headers (`X-API-Key` or
+ * `Authorization: Bearer`) so they never end up in URLs, proxies or logs.
  */
 export function apiKeyAuth(req: Request, res: Response, next: NextFunction): void {
-  // Auth disabled — skip
-  if (!config.auth.enabled || config.auth.apiKeys.length === 0) {
+  if (!config.auth.enabled) {
+    req.principal = ANONYMOUS;
     return next();
   }
-
-  // Health check is always public
-  if (req.path === '/health') {
-    return next();
-  }
-
-  const key = (req.headers['x-api-key'] as string) || (req.query['api_key'] as string);
-
+  const key = extractKey(req);
   if (!key) {
-    logger.warn('API request rejected: missing API key', { path: req.path, ip: req.ip });
     res.status(401).json({
       success: false,
       error: 'Unauthorized',
-      message: 'An API key is required. Provide it via the X-API-Key header or api_key query parameter.'
+      message: 'An API key is required in the X-API-Key header (or Authorization: Bearer <key>).',
     });
     return;
   }
-
-  if (!config.auth.apiKeys.includes(key)) {
-    logger.warn('API request rejected: invalid API key', { path: req.path, ip: req.ip });
-    res.status(403).json({
-      success: false,
-      error: 'Forbidden',
-      message: 'The provided API key is not valid.'
-    });
+  const principal = principalForKey(key);
+  if (!principal) {
+    log.warn('Rejected invalid API key', { path: req.path, ip: req.ip });
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'The provided API key is not valid.' });
     return;
   }
+  req.principal = principal;
+  next();
+}
 
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (!req.principal?.admin) {
+    res.status(403).json({ success: false, error: 'Forbidden', message: 'This endpoint requires an admin API key.' });
+    return;
+  }
   next();
 }

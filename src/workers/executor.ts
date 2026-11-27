@@ -1,293 +1,212 @@
-import { spawn, ChildProcess } from 'child_process';
-import { EventEmitter } from 'events';
-import { createJobLogger } from '../utils/logger';
-import { JobData, JobResult } from '../utils/types';
-import config from '../config';
-import path from 'path';
+import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs/promises';
+import path from 'path';
+import config from '../config';
+import { RUNTIMES } from '../jobs/runtimes';
+import { createJobLogger } from '../utils/logger';
+import {
+  ExecutionOutcome,
+  ExecutionResult,
+  Executor,
+  JobRecord,
+  KillReason,
+  OutputListener,
+} from '../utils/types';
+import { OutputCollector } from './output';
+import { collectFromDirectory } from './artifacts';
 
-export class TestExecutor extends EventEmitter {
-  private process: ChildProcess | null = null;
-  private jobData: JobData;
-  private logger: any;
-  private startTime: Date | null = null;
-  private killed: boolean = false;
-  private stdoutBuffer: string[] = [];
-  private stderrBuffer: string[] = [];
+export const OUTCOME_FOR_KILL: Record<KillReason, ExecutionOutcome> = {
+  cancel: 'cancelled',
+  timeout: 'timeout',
+  shutdown: 'interrupted',
+};
 
-  constructor(jobData: JobData) {
-    super();
-    this.jobData = jobData;
-    this.logger = createJobLogger(jobData.id);
+/** argv for a job: either `<interpreter> <scriptFile>` or `<command> ...args`. */
+export function buildArgv(record: JobRecord, scriptPath: string): string[] {
+  if (record.script !== undefined) {
+    const runtime = RUNTIMES[record.language ?? 'bash'];
+    return [...runtime.interpreter, scriptPath];
+  }
+  if (!record.command) throw new Error('Job has neither a script nor a command');
+  return [record.command, ...(record.args ?? [])];
+}
+
+export function jobEnvironment(record: JobRecord, home: string, artifactsDir: string): Record<string, string> {
+  return {
+    HOME: home,
+    TESTFORGE_ARTIFACTS: artifactsDir,
+    TMPDIR: home,
+    LANG: 'C.UTF-8',
+    CI: 'true',
+    TESTFORGE: 'true',
+    TESTFORGE_JOB_ID: record.id,
+    ...(record.env ?? {}),
+  };
+}
+
+/**
+ * Runs a job as a child process on the worker host.
+ *
+ * NOT a security boundary: jobs run with the worker's privileges. Intended for
+ * local development and fully trusted submitters. Production uses DockerExecutor.
+ */
+export class LocalExecutor implements Executor {
+  private child: ChildProcess | null = null;
+  private exited = false;
+  private killReason: KillReason | null = null;
+  private readonly log;
+
+  constructor(
+    private readonly record: JobRecord,
+    private readonly onOutput?: OutputListener
+  ) {
+    this.log = createJobLogger(record.id);
   }
 
-  public async execute(): Promise<JobResult> {
-    this.startTime = new Date();
-    this.logger.info('Starting test execution', { 
-      command: this.jobData.command,
-      args: this.jobData.args,
-      timeout: this.jobData.timeout || config.workers.timeout
-    });
+  async run(): Promise<ExecutionResult> {
+    const started = Date.now();
+    const output = new OutputCollector(config.jobs.maxOutputBytes, this.onOutput);
+    const baseDir = path.resolve(config.workers.tempDir);
+    await fs.mkdir(baseDir, { recursive: true });
+    const workDir = await fs.mkdtemp(path.join(baseDir, `job-${this.record.id}-`));
 
-    let scriptPath: string | null = null;
     try {
-      // Validate and prepare execution
-      scriptPath = await this.prepareExecution();
-      
-      // Spawn the process
-      this.process = await this.spawnProcess();
-      
-      // Setup process handlers
-      this.setupProcessHandlers();
-      
-      // Wait for completion
-      const result = await this.waitForCompletion();
-      
-      this.logger.info('Test execution completed', { 
-        duration: result.duration,
-        exitCode: result.exitCode
-      });
-      
-      return result;
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      this.logger.error('Test execution failed', { error: err.message });
-      return this.createFailedResult(err);
+      let scriptPath = '';
+      if (this.record.script !== undefined) {
+        scriptPath = path.join(workDir, RUNTIMES[this.record.language ?? 'bash'].fileName);
+        await fs.writeFile(scriptPath, this.record.script, { mode: 0o600 });
+      }
+      const argv = buildArgv(this.record, scriptPath);
+      const artifactsDir = path.join(workDir, 'artifacts');
+      await fs.mkdir(artifactsDir);
+      if (this.killReason) return this.result(output, started, null, null);
+      const result = await this.spawnAndWait(argv, workDir, output, started);
+      if (result.outcome === 'interrupted') return result;
+      const collected = await collectFromDirectory(artifactsDir, config.artifacts);
+      return { ...result, artifacts: collected.artifacts, artifactsTruncated: collected.truncated };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.error('Local execution failed', { error: message });
+      return { ...this.result(output, started, null, null), outcome: 'failed', error: message };
     } finally {
-      // Cleanup temporary script file
-      if (scriptPath) {
-        try {
-          await fs.unlink(scriptPath);
-          this.logger.debug('Temporary script file deleted', { scriptPath });
-        } catch (error) {
-          this.logger.warn('Failed to delete temporary script file', { scriptPath, error });
-        }
-      }
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
-  private async prepareExecution(): Promise<string | null> {
-    // Security validation
-    if (this.jobData.script && this.jobData.script.length > config.security.maxScriptLength) {
-      throw new Error(`Script exceeds maximum length of ${config.security.maxScriptLength} characters`);
-    }
+  private spawnAndWait(
+    argv: string[],
+    workDir: string,
+    output: OutputCollector,
+    started: number
+  ): Promise<ExecutionResult> {
+    return new Promise((resolve) => {
+      const [cmd, ...args] = argv;
+      this.log.info('Spawning process', { cmd, args: args.length });
 
-    // Check for blocked patterns with improved robustness
-    const script = this.jobData.script || '';
-    const normalizedScript = script.toLowerCase().replace(/\s+/g, '');
-    
-    for (const pattern of config.security.blockedPatterns) {
-      const normalizedPattern = pattern.toLowerCase().replace(/\s+/g, '');
-      if (normalizedScript.includes(normalizedPattern)) {
-        throw new Error(`Script contains blocked pattern: ${pattern}`);
-      }
-    }
+      const env = {
+        PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+        ...jobEnvironment(this.record, workDir, path.join(workDir, 'artifacts')),
+      };
+      const child = spawn(cmd, args, {
+        cwd: workDir,
+        env,
+        // Own process group so the whole tree can be signalled.
+        detached: true,
+        // No stdin: interactive programs get EOF instead of hanging.
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false,
+      });
+      this.child = child;
 
-    // Validate command if provided
-    if (this.jobData.command) {
-      const baseCommand = this.jobData.command.trim().split(/\s+/)[0];
-      
-      if (!config.workers.allowedCommands.includes(baseCommand)) {
-        throw new Error(`Command '${baseCommand}' is not allowed`);
-      }
-    }
+      const timer = setTimeout(() => void this.kill('timeout'), this.record.timeoutMs);
+      let settled = false;
+      const finish = (code: number | null, signal: NodeJS.Signals | null, error?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        output.finish();
+        const res = this.result(output, started, code, signal);
+        resolve(error && res.outcome === 'failed' ? { ...res, error } : res);
+      };
 
-    // Create temporary script file if script is provided
-    if (this.jobData.script) {
-      const tempDir = path.join(process.cwd(), 'temp');
-      await fs.mkdir(tempDir, { recursive: true });
-      
-      const scriptPath = path.join(tempDir, `${this.jobData.id}.sh`);
-      await fs.writeFile(scriptPath, this.jobData.script, 'utf8');
-      await fs.chmod(scriptPath, '755');
-      
-      // Update job data to use script file
-      this.jobData.command = 'bash';
-      this.jobData.args = [scriptPath];
-      return scriptPath;
-    }
+      child.stdout?.on('data', (d: Buffer) => output.push('stdout', d));
+      child.stderr?.on('data', (d: Buffer) => output.push('stderr', d));
 
-    return null;
-  }
-
-  private async spawnProcess(): Promise<ChildProcess> {
-    const command = this.jobData.command || 'node';
-    const args = this.jobData.args || [];
-    const env = { ...process.env, ...this.jobData.env };
-
-    this.logger.info('Spawning process', { command, args });
-
-    const childProcess = spawn(command, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: env,
-      cwd: process.cwd(),
-      detached: false,
-      shell: false
-    });
-
-    // Basic resource limit monitoring
-
-    const monitorInterval = setInterval(() => {
-      // In a real system, we'd use something like 'usage' or 'pidusage' package
-      // For this implementation, we monitor duration and basic child state
-      if (this.killed || !childProcess.pid) {
-        clearInterval(monitorInterval);
-      }
-    }, 2000);
-
-    childProcess.on('exit', () => clearInterval(monitorInterval));
-
-    return childProcess;
-  }
-
-  private setupProcessHandlers(): void {
-    if (!this.process) return;
-
-    // Handle stdout
-    this.process.stdout?.on('data', (data: Buffer) => {
-      const output = data.toString();
-      this.stdoutBuffer.push(output);
-      this.emit('stdout', output);
-      this.logger.debug('stdout', { output: output.trim() });
-    });
-
-    // Handle stderr
-    this.process.stderr?.on('data', (data: Buffer) => {
-      const output = data.toString();
-      this.stderrBuffer.push(output);
-      this.emit('stderr', output);
-      this.logger.debug('stderr', { output: output.trim() });
-    });
-
-    // Handle process exit
-    this.process.on('exit', (code: number | null, signal: string | null) => {
-      this.logger.info('Process exited', { code, signal, killed: this.killed });
-      
-      if (this.killed) {
-        this.emit('killed');
-      } else if (code !== 0) {
-        this.emit('error', new Error(`Process exited with code ${code}`));
-      } else {
-        this.emit('completed');
-      }
-    });
-
-    // Handle process error
-    this.process.on('error', (error: Error) => {
-      this.logger.error('Process error', { error: error.message });
-      this.emit('error', error);
-    });
-  }
-
-  private async waitForCompletion(): Promise<JobResult> {
-    const timeout = this.jobData.timeout || config.workers.timeout;
-    
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        this.logger.warn('Process timeout, killing...');
-        this.kill();
-        reject(new Error(`Process timed out after ${timeout}ms`));
-      }, timeout);
-
-      this.once('completed', () => {
-        clearTimeout(timeoutId);
-        resolve(this.createSuccessResult());
+      child.on('error', (err) => {
+        this.exited = true;
+        const msg = (err as NodeJS.ErrnoException).code === 'ENOENT' ? `Command not found: ${cmd}` : err.message;
+        finish(null, null, msg);
       });
 
-      this.once('error', (error: Error) => {
-        clearTimeout(timeoutId);
-        resolve(this.createFailedResult(error));
-      });
-
-      this.once('killed', () => {
-        clearTimeout(timeoutId);
-        resolve(this.createKilledResult());
+      child.on('exit', (code, signal) => {
+        this.exited = true;
+        // Reap anything the job left running in the background.
+        this.signalGroup('SIGKILL');
+        // Give the pipes a moment to drain, but never wait on leaked descriptors.
+        const drain = setTimeout(() => finish(code, signal), 1000);
+        child.once('close', () => {
+          clearTimeout(drain);
+          finish(code, signal);
+        });
       });
     });
   }
 
-  public kill(): void {
-    if (!this.process || this.killed) return;
+  private result(
+    output: OutputCollector,
+    started: number,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): ExecutionResult {
+    let outcome: ExecutionOutcome;
+    let error: string | undefined;
+    if (this.killReason) {
+      outcome = OUTCOME_FOR_KILL[this.killReason];
+      error =
+        this.killReason === 'timeout'
+          ? `Timed out after ${this.record.timeoutMs}ms`
+          : this.killReason === 'cancel'
+            ? 'Cancelled by user'
+            : 'Interrupted by worker shutdown';
+    } else if (code === 0) {
+      outcome = 'completed';
+    } else {
+      outcome = 'failed';
+      error = signal ? `Process terminated by signal ${signal}` : `Process exited with code ${code}`;
+    }
+    return {
+      outcome,
+      exitCode: code,
+      stdout: output.stdout,
+      stderr: output.stderr,
+      truncated: output.truncated,
+      durationMs: Date.now() - started,
+      error,
+    };
+  }
 
-    this.killed = true;
-    this.logger.info('Killing process');
+  private signalGroup(signal: NodeJS.Signals): void {
+    const pid = this.child?.pid;
+    if (!pid) return;
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      /* group already gone */
+    }
+  }
 
-    // Try graceful shutdown first
-    this.process.kill('SIGTERM');
-
-    // Force kill after timeout
-    setTimeout(() => {
-      if (this.process && !this.process.killed) {
-        this.logger.warn('Force killing process');
-        this.process.kill('SIGKILL');
+  async kill(reason: KillReason): Promise<void> {
+    if (this.killReason) return;
+    this.killReason = reason;
+    if (!this.child || this.exited) return;
+    this.log.info('Stopping process group', { reason });
+    this.signalGroup('SIGTERM');
+    const escalate = setTimeout(() => {
+      if (!this.exited) {
+        this.log.warn('Process ignored SIGTERM, sending SIGKILL');
+        this.signalGroup('SIGKILL');
       }
-    }, config.workers.killTimeout);
-  }
-
-  private createSuccessResult(): JobResult {
-    const endTime = new Date();
-    const duration = this.startTime ? endTime.getTime() - this.startTime.getTime() : 0;
-
-    return {
-      id: this.jobData.id,
-      status: 'completed',
-      startTime: this.startTime!,
-      endTime,
-      duration,
-      exitCode: this.process?.exitCode || 0,
-      stdout: this.stdoutBuffer.join(''),
-      stderr: this.stderrBuffer.join(''),
-      metadata: this.jobData.metadata,
-      createdAt: this.jobData.createdAt,
-      updatedAt: endTime
-    };
-  }
-
-  private createFailedResult(error: Error): JobResult {
-    const endTime = new Date();
-    const duration = this.startTime ? endTime.getTime() - this.startTime.getTime() : 0;
-
-    return {
-      id: this.jobData.id,
-      status: 'failed',
-      startTime: this.startTime!,
-      endTime,
-      duration,
-      exitCode: this.process?.exitCode || 1,
-      stdout: this.stdoutBuffer.join(''),
-      stderr: this.stderrBuffer.join(''),
-      error: error.message,
-      metadata: this.jobData.metadata,
-      createdAt: this.jobData.createdAt,
-      updatedAt: endTime
-    };
-  }
-
-  private createKilledResult(): JobResult {
-    const endTime = new Date();
-    const duration = this.startTime ? endTime.getTime() - this.startTime.getTime() : 0;
-
-    return {
-      id: this.jobData.id,
-      status: 'cancelled',
-      startTime: this.startTime!,
-      endTime,
-      duration,
-      exitCode: undefined,
-      stdout: this.stdoutBuffer.join(''),
-      stderr: this.stderrBuffer.join(''),
-      error: 'Process was killed',
-      metadata: this.jobData.metadata,
-      createdAt: this.jobData.createdAt,
-      updatedAt: endTime
-    };
-  }
-
-  public getProcessId(): number | null {
-    return this.process?.pid || null;
-  }
-
-  public isRunning(): boolean {
-    return this.process !== null && !this.process.killed && !this.killed;
+    }, config.workers.killGraceMs);
+    this.child.once('exit', () => clearTimeout(escalate));
   }
 }
