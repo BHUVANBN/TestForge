@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:coverage
+      - name: Integration tests (real Redis + BullMQ)
+        run: npm run test:integration
+        env:
+          REDIS_TEST_URL: redis://127.0.0.1:6379/0
+      - run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t testforge:ci .
+      - name: Smoke test image
+        run: |
+          docker network create tf
+          docker run -d --name redis --network tf redis:7-alpine
+          docker run -d --name api --network tf -p 3000:3000 \
+            -e ENGINE_MODE=api -e REDIS_HOST=redis -e API_KEYS=ci-user-key-0123456789 testforge:ci
+          for i in $(seq 1 30); do curl -sf localhost:3000/api/v1/health && break; sleep 1; done
+          curl -sf localhost:3000/dashboard.html > /dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:3000/api/v1/jobs)" = 401

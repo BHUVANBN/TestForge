@@ -3,45 +3,19 @@ import type { Config } from 'jest';
 const config: Config = {
   preset: 'ts-jest',
   testEnvironment: 'node',
-  roots: ['<rootDir>/src'],
-  testMatch: ['**/__tests__/**/*.ts', '**/*.test.ts', '**/*.spec.ts'],
+  roots: ['<rootDir>/src', '<rootDir>/test'],
+  testMatch: ['**/*.test.ts'],
+  setupFiles: ['<rootDir>/test/setup-env.ts'],
   transform: {
-    '^.+\\.tsx?$': [
-      'ts-jest',
-      {
-        tsconfig: {
-          // Allow importing JSON modules in tests
-          resolveJsonModule: true,
-          // Relax some strict checks for test mocks
-          noImplicitAny: false,
-        },
-      },
-    ],
+    '^.+\\.tsx?$': ['ts-jest', { tsconfig: 'tsconfig.test.json' }],
   },
-  moduleNameMapper: {
-    '^@/(.*)$': '<rootDir>/src/$1',
-  },
-  collectCoverageFrom: [
-    'src/**/*.ts',
-    '!src/**/*.d.ts',
-    '!src/cli/**',       // CLI is tested separately via E2E
-    '!src/index.ts',     // Entry point
-  ],
+  collectCoverageFrom: ['src/**/*.ts', '!src/**/*.d.ts', '!src/cli/**', '!src/index.ts'],
   coverageThreshold: {
-    global: {
-      branches: 45,
-      functions: 60,
-      lines: 60,
-      statements: 60,
-    },
+    global: { branches: 60, functions: 70, lines: 75, statements: 75 },
   },
   coverageDirectory: 'coverage',
-  coverageReporters: ['text', 'lcov', 'html'],
-  // Give Redis-backed tests more time
-  testTimeout: 15000,
-  // Show individual test results
-  verbose: true,
-  // Clear mocks between tests
+  coverageReporters: ['text-summary', 'lcov'],
+  testTimeout: 20000,
   clearMocks: true,
   restoreMocks: true,
 };

@@ -1,158 +1,94 @@
-import Redis from 'ioredis';
+import Redis, { RedisOptions } from 'ioredis';
 import config from '../config';
-import { logger } from '../utils/logger';
+import { createLogger } from '../utils/logger';
 
-class RedisConnection {
-  private static instance: RedisConnection;
-  private client: Redis;
-  private isConnected: boolean = false;
+const log = createLogger('redis');
+const connections = new Set<Redis>();
+let shared: Redis | null = null;
 
-  private constructor() {
-    this.client = new Redis({
-      host: config.redis.host,
-      port: config.redis.port,
-      password: config.redis.password,
-      db: config.redis.db,
-      maxRetriesPerRequest: config.redis.maxRetriesPerRequest,
-      lazyConnect: true,
-      reconnectOnError: (err: Error) => {
-        const targetError = 'READONLY';
-        return err.message.includes(targetError);
-      },
-    });
+const commonOptions = (): RedisOptions => ({
+  tls: config.redis.tls ? {} : undefined,
+  // Required by BullMQ; also lets commands queue while reconnecting instead of failing fast.
+  maxRetriesPerRequest: null,
+  enableReadyCheck: true,
+  retryStrategy: (times) => Math.min(times * 200, 5000),
+  reconnectOnError: (err) => err.message.includes('READONLY'),
+});
 
-    this.setupEventHandlers();
-  }
+export function redisOptions(): RedisOptions {
+  return {
+    ...commonOptions(),
+    host: config.redis.host,
+    port: config.redis.port,
+    username: config.redis.username,
+    password: config.redis.password,
+    db: config.redis.db,
+  };
+}
 
-  public static getInstance(): RedisConnection {
-    if (!RedisConnection.instance) {
-      RedisConnection.instance = new RedisConnection();
-    }
-    return RedisConnection.instance;
-  }
+/** Open a new dedicated connection (BullMQ classes and subscribers each need their own). */
+export function createRedis(name: string): Redis {
+  const client = config.redis.url
+    ? new Redis(config.redis.url, commonOptions())
+    : new Redis(redisOptions());
+  client.on('error', (err) => log.error('Redis error', { connection: name, error: err.message }));
+  client.on('reconnecting', (ms: number) => log.warn('Redis reconnecting', { connection: name, inMs: ms }));
+  client.on('ready', () => log.debug('Redis ready', { connection: name }));
+  client.on('end', () => connections.delete(client));
+  connections.add(client);
+  return client;
+}
 
-  private setupEventHandlers(): void {
-    this.client.on('connect', () => {
-      logger.info('Redis connection established');
-      this.isConnected = true;
-    });
+/** Shared connection for regular (non-blocking) commands. */
+export function getRedis(): Redis {
+  if (!shared) shared = createRedis('shared');
+  return shared;
+}
 
-    this.client.on('ready', () => {
-      logger.info('Redis client ready');
-    });
+/** Test helper. */
+export function setRedis(client: Redis): void {
+  shared = client;
+}
 
-    this.client.on('error', (error) => {
-      logger.error('Redis connection error', { error: error.message });
-      this.isConnected = false;
-    });
+export function redisKey(...parts: string[]): string {
+  return [config.redis.keyPrefix, ...parts].join(':');
+}
 
-    this.client.on('close', () => {
-      logger.warn('Redis connection closed');
-      this.isConnected = false;
-    });
-
-    this.client.on('reconnecting', (ms: number) => {
-      logger.info(`Redis reconnecting in ${ms}ms`);
-    });
-  }
-
-  private waitForReady(timeoutMs: number = 5000): Promise<void> {
-    if (this.client.status === 'ready') {
-      this.isConnected = true;
-      return Promise.resolve();
-    }
-
-    return new Promise((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        cleanup();
-        reject(new Error(`Timed out waiting for Redis ready state (status=${this.client.status})`));
-      }, timeoutMs);
-
-      const onReady = () => {
-        cleanup();
-        this.isConnected = true;
-        resolve();
-      };
-
-      const onError = (error: Error) => {
-        cleanup();
-        reject(error);
-      };
-
-      const cleanup = () => {
-        clearTimeout(timeoutId);
-        this.client.off('ready', onReady);
-        this.client.off('error', onError);
-      };
-
-      this.client.on('ready', onReady);
-      this.client.on('error', onError);
-    });
-  }
-
-  public async connect(): Promise<void> {
+export async function waitForRedis(timeoutMs = 15_000): Promise<void> {
+  const client = getRedis();
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
     try {
-      if (this.client.status === 'ready') {
-        this.isConnected = true;
-        return;
-      }
-
-      if (this.client.status === 'connecting' || this.client.status === 'connect') {
-        await this.waitForReady();
-        return;
-      }
-
-      await this.client.connect();
-      await this.waitForReady();
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      logger.error('Failed to connect to Redis', {
-        error: err.message,
-        host: config.redis.host,
-        port: config.redis.port,
-        status: this.client.status,
-      });
-      throw err;
+      if ((await client.ping()) === 'PONG') return;
+    } catch (err) {
+      lastError = err;
     }
+    await new Promise((r) => setTimeout(r, 500));
   }
+  throw new Error(
+    `Redis not reachable at ${config.redis.url ?? `${config.redis.host}:${config.redis.port}`}: ${
+      lastError instanceof Error ? lastError.message : 'timeout'
+    }`
+  );
+}
 
-  public async disconnect(): Promise<void> {
-    try {
-      await this.client.disconnect();
-      this.isConnected = false;
-      logger.info('Redis connection closed');
-    } catch (error) {
-      logger.error('Error closing Redis connection', { error });
-      throw error;
-    }
-  }
-
-  public getClient(): Redis {
-    return this.client;
-  }
-
-  public isConnectionActive(): boolean {
-    return this.isConnected && this.client.status === 'ready';
-  }
-
-  public async ping(): Promise<string> {
-    try {
-      const result = await this.client.ping();
-      return result;
-    } catch (error) {
-      logger.error('Redis ping failed', { error });
-      throw error;
-    }
-  }
-
-  public async healthCheck(): Promise<boolean> {
-    try {
-      const pong = await this.ping();
-      return pong === 'PONG';
-    } catch (error) {
-      return false;
-    }
+export async function redisHealthy(): Promise<boolean> {
+  try {
+    return (await getRedis().ping()) === 'PONG';
+  } catch {
+    return false;
   }
 }
 
-export default RedisConnection;
+export async function closeAllRedis(): Promise<void> {
+  await Promise.all(
+    [...connections].map((c) =>
+      c.quit().catch(() => {
+        c.disconnect();
+      })
+    )
+  );
+  connections.clear();
+  shared = null;
+}

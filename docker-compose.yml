@@ -1,134 +1,140 @@
-version: '3.8'
+# TestForge production stack.
+#
+#   ./scripts/init-env.sh            # one-time: writes .env with random secrets
+#   docker compose up -d --build     # redis + api + worker
+#   docker compose --profile monitoring up -d   # + prometheus + grafana
+#   docker compose up -d --scale worker=4       # more worker capacity
+#
+name: testforge
+
+x-app: &app
+  build: .
+  image: testforge:latest
+  restart: unless-stopped
+  init: true
+  env_file:
+    - path: .env
+      required: false
+  environment: &app-env
+    NODE_ENV: production
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set (run ./scripts/init-env.sh)}
+    API_AUTH_ENABLED: ${API_AUTH_ENABLED:-true}
+    API_KEYS: ${API_KEYS:-}
+    ADMIN_API_KEYS: ${ADMIN_API_KEYS:-}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+  depends_on:
+    redis:
+      condition: service_healthy
+  networks:
+    - backend
 
 services:
   redis:
-    image: redis:7-alpine
-    container_name: testforge-redis
+    image: redis:7.4-alpine
     restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    # BullMQ requires noeviction: an evicting policy silently deletes queue keys.
+    command: >
+      sh -c 'exec redis-server --appendonly yes --maxmemory-policy noeviction
+      --requirepass "$$REDIS_PASSWORD"'
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     networks:
-      - testforge-network
+      - backend
 
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: testforge-engine
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 30s
-    ports:
-      - "3000:3000"
+  api:
+    <<: *app
     environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - HOST=0.0.0.0
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
-      - LOG_LEVEL=info
-      - WORKER_POOL_SIZE=10
-      - QUEUE_CONCURRENCY=5
-      - WORKER_TIMEOUT=300000
-      - QUEUE_ATTEMPTS=3
-      - RATE_LIMIT_MAX=100
-      - RATE_LIMIT_WINDOW_MS=900000
-      # Optional: set to true and provide API_KEYS to enable auth
-      - API_AUTH_ENABLED=${API_AUTH_ENABLED:-false}
-      - API_KEYS=${API_KEYS:-}
-    volumes:
-      - app_logs:/app/logs
-      - app_temp:/app/temp
-    depends_on:
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/v1/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    networks:
-      - testforge-network
+      <<: *app-env
+      ENGINE_MODE: api
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+    ports:
+      - "${API_BIND:-0.0.0.0}:${API_PORT:-3000}:3000"
+    stop_grace_period: 20s
 
-  # ── Observability ────────────────────────────────────────────────────────────
+  worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      ENGINE_MODE: worker
+      WORKER_EXECUTOR: docker
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      WORKER_MAX_MEMORY_MB: ${WORKER_MAX_MEMORY_MB:-512}
+      WORKER_CPUS: ${WORKER_CPUS:-1}
+      WORKER_NETWORK_ENABLED: ${WORKER_NETWORK_ENABLED:-false}
+      DOCKER_RUNTIME: ${DOCKER_RUNTIME:-}
+      SHUTDOWN_TIMEOUT: "45000"
+    # The worker launches each job as a sibling container on the host's Docker
+    # daemon. Only the worker gets the socket; the public-facing API never does.
+    # Anyone who can control the worker process controls the host: keep it on
+    # a dedicated machine/VM, and consider DOCKER_RUNTIME=runsc (gVisor).
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    stop_grace_period: 60s
 
   prometheus:
-    image: prom/prometheus:v2.51.0
-    container_name: testforge-prometheus
+    image: prom/prometheus:v2.54.1
     restart: unless-stopped
+    profiles: ["monitoring"]
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=15d'
-      - '--web.enable-lifecycle'
-    depends_on:
-      app:
-        condition: service_healthy
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
     networks:
-      - testforge-network
+      - backend
 
   grafana:
-    image: grafana/grafana:10.4.1
-    container_name: testforge-grafana
+    image: grafana/grafana:11.2.0
     restart: unless-stopped
+    profiles: ["monitoring"]
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-testforge}
-      - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/grafana-dashboard.json
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/testforge.json
     volumes:
       - grafana_data:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./docker/grafana-dashboard.json:/etc/grafana/provisioning/dashboards/grafana-dashboard.json:ro
     depends_on:
       - prometheus
     networks:
-      - testforge-network
-
-  # ── Optional tools (enabled with --profile tools) ────────────────────────────
+      - backend
 
   redis-commander:
     image: rediscommander/redis-commander:latest
-    container_name: testforge-redis-commander
     restart: unless-stopped
+    profiles: ["tools"]
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     environment:
-      - REDIS_HOSTS=local:redis:6379
+      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD}
     depends_on:
       - redis
     networks:
-      - testforge-network
-    profiles:
-      - tools
+      - backend
 
 volumes:
   redis_data:
-    driver: local
-  app_logs:
-    driver: local
-  app_temp:
-    driver: local
   prometheus_data:
-    driver: local
   grafana_data:
-    driver: local
 
 networks:
-  testforge-network:
-    driver: bridge
+  backend:

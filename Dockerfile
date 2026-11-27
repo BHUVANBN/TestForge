@@ -1,59 +1,37 @@
-FROM node:18-alpine AS builder
+# syntax=docker/dockerfile:1
 
-# Set working directory
+# ---- build -------------------------------------------------------------------
+FROM node:22-alpine AS build
 WORKDIR /app
 
-RUN apk add --no-cache bash curl && rm -rf /var/cache/apk/*
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
-# Copy package files
-COPY package*.json ./
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev --no-audit --no-fund
 
-RUN npm ci
+# ---- runtime -----------------------------------------------------------------
+FROM node:22-alpine
+ENV NODE_ENV=production \
+    PORT=3000 \
+    METRICS_PORT=9100
 
-# Copy source code
-COPY . .
-
-# Create necessary directories
-RUN mkdir -p logs/jobs temp
-
-# Build the application
-RUN npm run build
-
-
-FROM node:18-alpine AS runner
+RUN apk add --no-cache tini
 
 WORKDIR /app
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node package.json ./
+COPY --chown=node:node public ./public
+RUN mkdir -p /app/temp && chown node:node /app/temp
 
-RUN apk add --no-cache bash curl && rm -rf /var/cache/apk/*
+USER node
+EXPOSE 3000 9100
 
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001
+# Works for both API and worker processes (served by the internal metrics listener).
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.METRICS_PORT||9100)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-# Copy package files
-COPY package*.json ./
-
-# Install production dependencies only
-RUN npm ci --omit=dev && npm cache clean --force
-
-# Copy compiled output and runtime files
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/.env.example ./.env.example
-COPY --from=builder /app/README.md ./README.md
-
-# Create necessary directories
-RUN mkdir -p logs/jobs temp && \
-    chown -R nodejs:nodejs logs temp
-
-# Switch to non-root user
-USER nodejs
-
-# Expose port
-EXPOSE 3000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:3000/api/v1/health || exit 1
-
-# Start the application
-CMD ["npm", "start"]
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/index.js"]

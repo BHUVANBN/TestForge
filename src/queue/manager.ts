@@ -1,203 +1,126 @@
-import { Job, Queue, QueueEvents } from 'bullmq';
-import RedisConnection from './redis';
-import { logger } from '../utils/logger';
-import { JobData, QueueStats } from '../utils/types';
+import { Job, Queue } from 'bullmq';
 import config from '../config';
+import { createRedis } from './redis';
+import { QueuePayload, QueueStats } from '../utils/types';
 
+/** Thin wrapper around the BullMQ queue (producer side). */
 export class QueueManager {
-  private static instance: QueueManager;
-  private testQueue: Queue;
-  private queueEvents: QueueEvents;
-  private redisConnection: RedisConnection;
+  private static instance: QueueManager | null = null;
+  private readonly queue: Queue<QueuePayload>;
 
-  private constructor() {
-    this.redisConnection = RedisConnection.getInstance();
-    const redisClient = this.redisConnection.getClient();
-
-    // Initialize the test execution queue
-    this.testQueue = new Queue('test-execution', {
-      connection: redisClient,
-      defaultJobOptions: config.queue.defaultJobOptions,
-    });
-
-    // Initialize queue events listener
-    this.queueEvents = new QueueEvents('test-execution', {
-      connection: redisClient,
-    });
-
-    this.setupQueueEventHandlers();
+  constructor(queue?: Queue<QueuePayload>) {
+    this.queue =
+      queue ??
+      new Queue<QueuePayload>(config.queue.name, {
+        connection: createRedis('queue'),
+        defaultJobOptions: {
+          // Durable history lives in JobStore; BullMQ only needs short retention.
+          removeOnComplete: { age: 3600, count: 1000 },
+          removeOnFail: { age: 24 * 3600, count: 5000 },
+        },
+      });
   }
 
-  public static getInstance(): QueueManager {
-    if (!QueueManager.instance) {
-      QueueManager.instance = new QueueManager();
-    }
+  static getInstance(): QueueManager {
+    if (!QueueManager.instance) QueueManager.instance = new QueueManager();
     return QueueManager.instance;
   }
 
-  private setupQueueEventHandlers(): void {
-    this.queueEvents.on('completed', ({ jobId, returnvalue }) => {
-      logger.info('Job completed', { jobId, result: returnvalue });
-    });
-
-    this.queueEvents.on('failed', ({ jobId, failedReason }) => {
-      logger.error('Job failed', { jobId, error: failedReason });
-    });
-
-    this.queueEvents.on('stalled', ({ jobId }) => {
-      logger.warn('Job stalled', { jobId });
-    });
-
-    this.queueEvents.on('progress', ({ jobId, data }) => {
-      logger.debug('Job progress', { jobId, progress: data });
-    });
+  static setInstance(manager: QueueManager | null): void {
+    QueueManager.instance = manager;
   }
 
-  public async addJob(jobData: JobData): Promise<Job<JobData>> {
+  async add(jobId: string, attempts: number): Promise<Job<QueuePayload>> {
+    return this.queue.add(
+      'execute-test',
+      { jobId },
+      {
+        jobId,
+        attempts,
+        backoff: { type: 'exponential', delay: config.queue.backoffDelayMs },
+      }
+    );
+  }
+
+  async getJob(jobId: string): Promise<Job<QueuePayload> | undefined> {
+    return this.queue.getJob(jobId);
+  }
+
+  /**
+   * Remove a job that has not started yet. Returns false if it is already
+   * running (locked by a worker) or gone.
+   */
+  async removeIfPending(jobId: string): Promise<boolean> {
+    const job = await this.queue.getJob(jobId);
+    if (!job) return false;
+    const state = await job.getState();
+    if (!['waiting', 'delayed', 'prioritized', 'waiting-children'].includes(state)) return false;
     try {
-      const job = await this.testQueue.add(
-        'execute-test',
-        jobData,
-        {
-          jobId: jobData.id,
-          removeOnComplete: config.queue.defaultJobOptions.removeOnComplete,
-          removeOnFail: config.queue.defaultJobOptions.removeOnFail,
-          attempts: jobData.retries || config.queue.defaultJobOptions.attempts,
-          backoff: config.queue.defaultJobOptions.backoff,
+      await job.remove();
+      return true;
+    } catch {
+      // Picked up by a worker between getState() and remove().
+      return false;
+    }
+  }
+
+  async getStats(): Promise<QueueStats> {
+    const [counts, paused] = await Promise.all([
+      this.queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
+      this.queue.isPaused(),
+    ]);
+    return {
+      waiting: counts.waiting ?? 0,
+      active: counts.active ?? 0,
+      completed: counts.completed ?? 0,
+      failed: counts.failed ?? 0,
+      delayed: counts.delayed ?? 0,
+      paused,
+    };
+  }
+
+  async pause(): Promise<void> {
+    await this.queue.pause();
+  }
+
+  async resume(): Promise<void> {
+    await this.queue.resume();
+  }
+
+  /** Remove every job that has not started yet; returns their ids. */
+  async removePending(): Promise<string[]> {
+    const removed: string[] = [];
+    for (;;) {
+      const jobs = await this.queue.getJobs(['waiting', 'delayed', 'prioritized'], 0, 499);
+      if (jobs.length === 0) break;
+      let progressed = false;
+      for (const job of jobs) {
+        try {
+          await job.remove();
+          removed.push(job.id!);
+          progressed = true;
+        } catch {
+          /* started meanwhile */
         }
-      );
-
-      logger.info('Job added to queue', { jobId: jobData.id });
-      return job;
-    } catch (error) {
-      logger.error('Failed to add job to queue', { jobId: jobData.id, error });
-      throw error;
-    }
-  }
-
-  public async getJob(jobId: string): Promise<Job<JobData> | null> {
-    try {
-      return await this.testQueue.getJob(jobId) || null;
-    } catch (error) {
-      logger.error('Failed to get job', { jobId, error });
-      throw error;
-    }
-  }
-
-  public async getJobStatus(jobId: string): Promise<string> {
-    try {
-      const job = await this.getJob(jobId);
-      if (!job) {
-        return 'not_found';
       }
-
-      const state = await job.getState();
-      return state;
-    } catch (error) {
-      logger.error('Failed to get job status', { jobId, error });
-      throw error;
+      if (!progressed) break;
     }
+    await this.queue.clean(0, 0, 'completed');
+    await this.queue.clean(0, 0, 'failed');
+    return removed;
   }
 
-  public async cancelJob(jobId: string): Promise<void> {
+  async ping(): Promise<boolean> {
     try {
-      const job = await this.getJob(jobId);
-      if (job && (await job.isActive())) {
-        await job.remove();
-        logger.info('Job cancelled', { jobId });
-      }
-    } catch (error) {
-      logger.error('Failed to cancel job', { jobId, error });
-      throw error;
+      const client = await this.queue.client;
+      return (await client.ping()) === 'PONG';
+    } catch {
+      return false;
     }
   }
 
-  public async retryJob(jobId: string): Promise<void> {
-    try {
-      const job = await this.getJob(jobId);
-      if (job && (await job.isFailed())) {
-        await job.retry();
-        logger.info('Job retried', { jobId });
-      }
-    } catch (error) {
-      logger.error('Failed to retry job', { jobId, error });
-      throw error;
-    }
-  }
-
-  public async getQueueStats(): Promise<QueueStats> {
-    try {
-      const counts = await this.testQueue.getJobCounts(
-        'waiting',
-        'active',
-        'completed',
-        'failed',
-        'delayed',
-        'paused'
-      );
-
-      return {
-        waiting: counts.waiting ?? 0,
-        active: counts.active ?? 0,
-        completed: counts.completed ?? 0,
-        failed: counts.failed ?? 0,
-        delayed: counts.delayed ?? 0,
-        paused: counts.paused ?? 0,
-      };
-    } catch (error) {
-      logger.error('Failed to get queue stats', { error });
-      throw error;
-    }
-  }
-
-  public async pauseQueue(): Promise<void> {
-    try {
-      await this.testQueue.pause();
-      logger.info('Queue paused');
-    } catch (error) {
-      logger.error('Failed to pause queue', { error });
-      throw error;
-    }
-  }
-
-  public async resumeQueue(): Promise<void> {
-    try {
-      await this.testQueue.resume();
-      logger.info('Queue resumed');
-    } catch (error) {
-      logger.error('Failed to resume queue', { error });
-      throw error;
-    }
-  }
-
-  public async clearQueue(): Promise<void> {
-    try {
-      await this.testQueue.clean(0, 0, 'completed');
-      await this.testQueue.clean(0, 0, 'failed');
-      logger.info('Queue cleared');
-    } catch (error) {
-      logger.error('Failed to clear queue', { error });
-      throw error;
-    }
-  }
-
-  public getQueueInstance(): Queue {
-    return this.testQueue;
-  }
-
-  public getQueueEvents(): QueueEvents {
-    return this.queueEvents;
-  }
-
-  public async close(): Promise<void> {
-    try {
-      await this.testQueue.close();
-      await this.queueEvents.close();
-      logger.info('Queue manager closed');
-    } catch (error) {
-      logger.error('Error closing queue manager', { error });
-      throw error;
-    }
+  async close(): Promise<void> {
+    await this.queue.close();
   }
 }
 

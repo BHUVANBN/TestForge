@@ -1,295 +1,176 @@
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
 import compression from 'compression';
+import cors from 'cors';
+import express, { NextFunction, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
-import { createServer } from 'http';
+import helmet from 'helmet';
+import { createServer, Server as HttpServer } from 'http';
 import path from 'path';
 import { Server as SocketIOServer } from 'socket.io';
-import type { Socket } from 'socket.io';
-import { logger } from '../utils/logger';
 import config from '../config';
-import { initMetrics } from '../utils/metrics';
-import RedisConnection from '../queue/redis';
-import QueueManager from '../queue/manager';
-import WorkerManager from '../workers/manager';
-
-// Import routes
-import jobsRouter from './routes/jobs';
-import systemRouter from './routes/system';
+import { JobError, JobService } from '../jobs/service';
+import { createLogger } from '../utils/logger';
+import { httpRequestDuration } from '../utils/metrics';
+import { VERSION } from '../version';
 import { apiKeyAuth } from './middleware/auth';
+import { attachRealtime } from './realtime';
+import { createJobsRouter } from './routes/jobs';
+import { createHealthRouter, createSystemRouter, SystemDeps } from './routes/system';
 
-class APIServer {
-  private app: express.Application;
-  private server: any;
-  private io: SocketIOServer;
-  private redisConnection: RedisConnection;
-  private queueManager: QueueManager;
-  private workerManager: WorkerManager;
+const log = createLogger('api');
 
-  constructor() {
-    this.app = express();
-    this.server = createServer(this.app);
-    this.io = new SocketIOServer(this.server, {
-      cors: {
-        origin: config.server.cors.origin,
-        credentials: config.server.cors.credentials
-      }
-    });
+export interface AppOptions {
+  jobs?: JobService;
+  system?: SystemDeps;
+}
 
-    this.redisConnection = RedisConnection.getInstance();
-    this.queueManager = QueueManager.getInstance();
-    this.workerManager = WorkerManager.getInstance();
+const clientKey = (req: Request): string => req.principal?.id ?? req.ip ?? 'unknown';
 
-    initMetrics();
-    this.setupMiddleware();
-    this.setupRoutes();
-    this.setupWebSocket();
-    this.setupErrorHandling();
-  }
+export function createApp(opts: AppOptions = {}): express.Application {
+  const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', config.server.trustProxy);
 
-  private setupMiddleware(): void {
-    // Security middleware (relax CSP for dashboard)
-    this.app.use(helmet({ contentSecurityPolicy: false }));
-    
-    // Serve static dashboard
-    this.app.use(express.static(path.join(process.cwd(), 'public')));
-    
-    // CORS middleware
-    this.app.use(cors(config.server.cors));
-    
-    // Compression middleware
-    this.app.use(compression());
-    
-    // Rate limiting
-    const limiter = rateLimit({
-      windowMs: config.server.rateLimit.windowMs,
-      max: config.server.rateLimit.max,
-      message: {
-        success: false,
-        error: 'Too many requests',
-        message: 'Rate limit exceeded'
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: ["'self'"],
+          styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+          fontSrc: ["'self'", 'https://fonts.gstatic.com'],
+          imgSrc: ["'self'", 'data:'],
+          connectSrc: ["'self'", 'ws:', 'wss:'],
+          objectSrc: ["'none'"],
+          frameAncestors: ["'none'"],
+        },
       },
-      standardHeaders: true,
-      legacyHeaders: false
-    });
-    this.app.use(limiter);
-    
-    // Body parsing middleware
-    this.app.use(express.json({ limit: '10mb' }));
-    this.app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-    
-    // Request logging middleware
-    this.app.use((req, res, next) => {
-      const start = Date.now();
-      
-      res.on('finish', () => {
-        const duration = Date.now() - start;
-        logger.info('HTTP Request', {
+    })
+  );
+  app.use(compression());
+
+  // Request logging + metrics. Logs the path only: never query strings or bodies.
+  app.use((req, res, next) => {
+    const start = process.hrtime.bigint();
+    res.on('finish', () => {
+      const seconds = Number(process.hrtime.bigint() - start) / 1e9;
+      const route = req.route?.path ? `${req.baseUrl}${req.route.path}` : 'unmatched';
+      httpRequestDuration.observe({ method: req.method, route, status: String(res.statusCode) }, seconds);
+      if (req.path.startsWith('/api')) {
+        log.http('request', {
           method: req.method,
-          url: req.url,
+          path: req.path,
           status: res.statusCode,
-          duration,
-          userAgent: req.get('User-Agent'),
-          ip: req.ip
+          ms: Math.round(seconds * 1000),
+          principal: req.principal?.id,
         });
-      });
-      
-      next();
+      }
+    });
+    next();
+  });
+
+  app.use(express.static(path.join(__dirname, '..', '..', 'public'), { maxAge: '1h', index: false }));
+  app.get('/', (_req, res) => res.redirect('/dashboard.html'));
+  app.get('/favicon.ico', (_req, res) => res.redirect(301, '/favicon.svg'));
+
+  app.get('/api', (_req, res) => {
+    res.json({
+      success: true,
+      message: 'TestForge distributed test execution engine',
+      version: VERSION,
+      dashboard: '/dashboard.html',
+    });
+  });
+
+  const api = express.Router();
+  api.use(cors({ origin: config.server.corsOrigins.length ? config.server.corsOrigins : false }));
+  api.use(createHealthRouter(opts.system));
+  api.use(express.json({ limit: config.server.bodyLimit }));
+  api.use(apiKeyAuth);
+  api.use(
+    rateLimit({
+      windowMs: config.server.rateLimit.windowMs,
+      limit: config.server.rateLimit.max,
+      keyGenerator: clientKey,
+      standardHeaders: 'draft-7',
+      legacyHeaders: false,
+      message: { success: false, error: 'Too many requests', message: 'Rate limit exceeded' },
+    })
+  );
+  const submitLimiter = rateLimit({
+    windowMs: config.server.rateLimit.windowMs,
+    limit: config.server.rateLimit.submitMax,
+    keyGenerator: clientKey,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { success: false, error: 'Too many submissions', message: 'Job submission rate limit exceeded' },
+  });
+  api.use(createJobsRouter({ service: opts.jobs, submitLimiter }));
+  api.use(createSystemRouter(opts.system));
+  app.use('/api/v1', api);
+
+  app.use((req, res) => {
+    res.status(404).json({ success: false, error: 'Not Found', message: `Route ${req.method} ${req.path} not found` });
+  });
+
+  app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof JobError) {
+      res.status(err.status).json({ success: false, error: err.message, details: err.details });
+      return;
+    }
+    if (err?.type === 'entity.parse.failed') {
+      res.status(400).json({ success: false, error: 'Invalid JSON body' });
+      return;
+    }
+    if (err?.type === 'entity.too.large') {
+      res.status(413).json({ success: false, error: 'Request body too large' });
+      return;
+    }
+    log.error('Unhandled request error', { method: req.method, path: req.path, error: err?.message, stack: err?.stack });
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  });
+
+  return app;
+}
+
+export class APIServer {
+  readonly app: express.Application;
+  readonly server: HttpServer;
+  readonly io: SocketIOServer;
+  private closeRealtime: (() => Promise<void>) | null = null;
+
+  constructor(opts: AppOptions = {}) {
+    this.app = createApp(opts);
+    this.server = createServer(this.app);
+    this.server.headersTimeout = 65_000;
+    this.server.keepAliveTimeout = 61_000;
+    this.io = new SocketIOServer(this.server, {
+      cors: { origin: config.server.corsOrigins.length ? config.server.corsOrigins : false },
+      maxHttpBufferSize: 64 * 1024,
     });
   }
 
-  private setupRoutes(): void {
-    // API routes — protected by optional API key auth
-    this.app.use('/api/v1', apiKeyAuth);
-    this.app.use('/api/v1', jobsRouter);
-    this.app.use('/api/v1', systemRouter);
-    
-    // Root endpoint - redirect to dashboard
-    this.app.get('/', (req, res) => {
-      res.redirect('/dashboard.html');
-    });
-
-    // API info endpoint
-    this.app.get('/api', (req, res) => {
-      res.json({
-        success: true,
-        message: 'Distributed Test Execution Engine API',
-        version: process.env.npm_package_version || '1.0.0',
-        dashboard: '/dashboard.html',
-        prometheus: '/api/v1/metrics/prometheus',
-        timestamp: new Date().toISOString(),
-        endpoints: {
-          jobs: {
-            list: 'GET /api/v1/jobs',
-            submit: 'POST /api/v1/submit-test',
-            status: 'GET /api/v1/status/:jobId',
-            logs: 'GET /api/v1/logs/:jobId',
-            result: 'GET /api/v1/result/:jobId',
-            cancel: 'DELETE /api/v1/jobs/:jobId',
-            retry: 'POST /api/v1/jobs/:jobId/retry'
-          },
-          system: {
-            health: 'GET /api/v1/health',
-            metrics: 'GET /api/v1/metrics',
-            prometheus: 'GET /api/v1/metrics/prometheus',
-            queueStats: 'GET /api/v1/queue/stats',
-            queuePause: 'POST /api/v1/queue/pause',
-            queueResume: 'POST /api/v1/queue/resume',
-            queueClear: 'DELETE /api/v1/queue/clear',
-            info: 'GET /api/v1/info'
-          }
-        }
-      });
-    });
-    
-    // 404 handler
-    this.app.use('*', (req, res) => {
-      res.status(404).json({
-        success: false,
-        error: 'Not Found',
-        message: `Route ${req.method} ${req.originalUrl} not found`
-      });
-    });
-  }
-
-  private setupWebSocket(): void {
-    this.io.on('connection', (socket: Socket) => {
-      logger.info('WebSocket client connected', { socketId: socket.id });
-      
-      // Join job-specific room for real-time updates
-      socket.on('subscribe-job', async (jobId: string) => {
-        socket.join(`job-${jobId}`);
-        logger.debug('Client subscribed to job updates', { socketId: socket.id, jobId });
-        
-        // Push current state immediately so the client isn't waiting for an event
-        try {
-          const status = await this.queueManager.getJobStatus(jobId);
-          const result = (status === 'completed' || status === 'failed') 
-            ? await this.workerManager.getJobResult(jobId) 
-            : null;
-            
-          socket.emit('job-state', { jobId, status, result });
-        } catch (error) {
-          logger.error('Failed to send initial job state via WS', { jobId, error });
-        }
-      });
-      
-      // Unsubscribe from job updates
-      socket.on('unsubscribe-job', (jobId: string) => {
-        socket.leave(`job-${jobId}`);
-        logger.debug('Client unsubscribed from job updates', { socketId: socket.id, jobId });
-      });
-      
-      // Handle disconnect
-      socket.on('disconnect', () => {
-        logger.info('WebSocket client disconnected', { socketId: socket.id });
-      });
-    });
-
-    // Listen to queue events and broadcast to WebSocket clients
-    this.queueManager.getQueueEvents().on('completed', ({ jobId, returnvalue }) => {
-      this.io.to(`job-${jobId}`).emit('job-completed', { jobId, result: returnvalue });
-    });
-
-    this.queueManager.getQueueEvents().on('failed', ({ jobId, failedReason }) => {
-      this.io.to(`job-${jobId}`).emit('job-failed', { jobId, error: failedReason });
-    });
-
-    this.queueManager.getQueueEvents().on('progress', ({ jobId, data }) => {
-      this.io.to(`job-${jobId}`).emit('job-progress', { jobId, progress: data });
-    });
-  }
-
-  private setupErrorHandling(): void {
-    // Global error handler for Express
-    this.app.use((error: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      logger.error('Unhandled express error', {
-        error: error.message,
-        stack: error.stack,
-        method: req.method,
-        url: req.url,
-        body: req.body
-      });
-
-      res.status(500).json({
-        success: false,
-        error: 'Internal Server Error',
-        message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
-      });
-    });
-  }
-
-  public async start(): Promise<void> {
-    try {
-      // Connect to Redis
-      await this.redisConnection.connect();
-      logger.info('Redis connection established');
-
-      // Start the server
+  async start(): Promise<void> {
+    this.closeRealtime = attachRealtime(this.io);
+    await new Promise<void>((resolve, reject) => {
+      this.server.once('error', reject);
       this.server.listen(config.server.port, config.server.host, () => {
-        logger.info(`Server started on ${config.server.host}:${config.server.port}`);
-        logger.info(`WebSocket server ready`);
+        this.server.off('error', reject);
+        resolve();
       });
-
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      logger.error('Failed to start server', { error: err.message });
-      throw err;
-    }
+    });
+    log.info(`API listening on http://${config.server.host}:${config.server.port}`, {
+      auth: config.auth.enabled ? 'enabled' : 'DISABLED',
+    });
   }
 
-  public async gracefulShutdown(): Promise<void> {
-    logger.info('Starting graceful shutdown');
-
-    try {
-      // Close HTTP server
-      if (this.server) {
-        await new Promise<void>((resolve) => {
-          this.server.close(() => {
-            logger.info('HTTP server closed');
-            resolve();
-          });
-        });
-      }
-
-      // Close WebSocket server
-      if (this.io) {
-        this.io.close();
-        logger.info('WebSocket server closed');
-      }
-
-      // Shutdown worker manager
-      await this.workerManager.gracefulShutdown();
-      logger.info('Worker manager shutdown');
-
-      // Close queue manager
-      await this.queueManager.close();
-      logger.info('Queue manager closed');
-
-      // Close Redis connection
-      await this.redisConnection.disconnect();
-      logger.info('Redis connection closed');
-
-      logger.info('Graceful shutdown complete');
-      process.exit(0);
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      logger.error('Error during graceful shutdown', { error: err.message });
-      process.exit(1);
-    }
-  }
-
-  public getApp(): express.Application {
-    return this.app;
-  }
-
-  public getServer(): any {
-    return this.server;
-  }
-
-  public getIO(): SocketIOServer {
-    return this.io;
+  async close(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.io.close(() => resolve());
+      // io.close() also closes the HTTP server; make sure idle keep-alives go too.
+      this.server.closeIdleConnections?.();
+    });
+    await this.closeRealtime?.();
+    log.info('API server closed');
   }
 }
 
