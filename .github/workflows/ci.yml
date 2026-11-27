@@ -20,17 +20,32 @@ jobs:
         ports: ['6379:6379']
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: testforge
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      HISTORY_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/testforge
+      S3_TEST_ENDPOINT: http://127.0.0.1:8333
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      - name: Start S3-compatible store (SeaweedFS)
+        run: |
+          docker run -d --name s3 -p 8333:8333 chrislusf/seaweedfs:3.80 server -s3
+          for i in $(seq 1 30); do curl -s -o /dev/null localhost:8333 && break; sleep 1; done
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run test:coverage
-      - name: Integration tests (real Redis + BullMQ)
+      - name: Integration tests (real Redis, BullMQ, Postgres history, S3 artifacts)
         run: npm run test:integration
         env:
           REDIS_TEST_URL: redis://127.0.0.1:6379/0

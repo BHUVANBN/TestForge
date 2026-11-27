@@ -15,9 +15,11 @@ import { apiKeyAuth } from './middleware/auth';
 import { attachRealtime } from './realtime';
 import { createJobsRouter } from './routes/jobs';
 import { createBatchesRouter } from './routes/batches';
+import { createHistoryRouter } from './routes/history';
+import { HistoryStore } from '../history';
 import { RedisRateLimitStore } from './rateLimitStore';
 import { BatchService } from '../jobs/batches';
-import { ArtifactStore } from '../jobs/artifacts';
+import { ArtifactRepository } from '../jobs/artifacts';
 import { createHealthRouter, createSystemRouter, SystemDeps } from './routes/system';
 
 const log = createLogger('api');
@@ -25,8 +27,9 @@ const log = createLogger('api');
 export interface AppOptions {
   jobs?: JobService;
   batches?: BatchService;
-  artifacts?: ArtifactStore;
+  artifacts?: ArtifactRepository;
   system?: SystemDeps;
+  history?: () => HistoryStore | null;
   /** Override the rate-limit store (tests). */
   rateLimitStore?: 'redis' | 'memory';
 }
@@ -121,6 +124,7 @@ export function createApp(opts: AppOptions = {}): express.Application {
   });
   api.use(createJobsRouter({ service: opts.jobs, submitLimiter, artifacts: opts.artifacts }));
   api.use(createBatchesRouter({ service: opts.batches, submitLimiter }));
+  api.use(createHistoryRouter({ history: opts.history }));
   api.use(createSystemRouter(opts.system));
   app.use('/api/v1', api);
 

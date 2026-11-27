@@ -5,10 +5,11 @@ import { randomUUID } from 'crypto';
 import config from '../config';
 import { channels, CancelEvent, publishLog, publishStatus } from '../jobs/events';
 import { getJobStore, JobStore } from '../jobs/store';
-import { ArtifactStore, getArtifactStore } from '../jobs/artifacts';
+import { ArtifactRepository, getArtifactStore } from '../jobs/artifacts';
 import { finalizeJob } from '../jobs/lifecycle';
 import { buildReport } from '../jobs/report';
 import { startWebhookWorker, WebhookDelivery } from '../webhooks';
+import { getHistory, startHistoryWorker } from '../history';
 import { createRedis, getRedis, redisKey } from '../queue/redis';
 import { createLogger } from '../utils/logger';
 import {
@@ -17,11 +18,26 @@ import {
   workersActiveGauge,
   workersIdleGauge,
 } from '../utils/metrics';
-import { ExecutionResult, Executor, JobRecord, OutputListener, QueuePayload, WorkerHeartbeat } from '../utils/types';
+import {
+  ExecutionResult,
+  Executor,
+  isTerminal,
+  JobRecord,
+  OutputListener,
+  QueuePayload,
+  WorkerHeartbeat,
+} from '../utils/types';
+import QueueManager from '../queue/manager';
 import { DockerExecutor, removeOrphanContainers } from './dockerExecutor';
 import { LocalExecutor } from './executor';
 
 const log = createLogger('worker');
+const RECONCILE_GRACE_MS = 2 * 60_000;
+const RECONCILE_INTERVAL_MS = 2 * 60_000;
+
+/** A job attempt that ran and failed (already recorded); BullMQ decides on retries. */
+class AttemptFailed extends Error {}
+export const ARTIFACT_SAVE_TIMEOUT_MS = 120_000;
 
 export type ExecutorFactory = (record: JobRecord, onOutput: OutputListener) => Executor;
 
@@ -37,7 +53,9 @@ export interface WorkerManagerOptions {
   connect?: (name: string) => Redis;
   /** Skip Docker orphan cleanup (tests). */
   skipOrphanCleanup?: boolean;
-  artifacts?: ArtifactStore;
+  artifacts?: ArtifactRepository;
+  /** Queue access for the reconciler (tests). */
+  queue?: Pick<QueueManager, 'getJob'>;
   /** Run the webhook delivery worker in this process (default: when startWorker). */
   deliverWebhooks?: boolean;
 }
@@ -46,7 +64,10 @@ export class WorkerManager {
   readonly id = `${os.hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
   private worker: Worker<QueuePayload> | null = null;
   private webhookWorker: Worker<WebhookDelivery> | null = null;
-  private readonly artifacts: ArtifactStore;
+  private historyWorker: Worker<any> | null = null;
+  private purgeTimer: NodeJS.Timeout | null = null;
+  private reconcileTimer: NodeJS.Timeout | null = null;
+  private readonly artifacts: ArtifactRepository;
   private subscriber: Redis | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private readonly active = new Map<string, Executor>();
@@ -101,10 +122,26 @@ export class WorkerManager {
     }
     if (this.opts.deliverWebhooks ?? this.opts.startWorker !== false) {
       this.webhookWorker = startWebhookWorker(connect);
+      this.historyWorker = startHistoryWorker(connect);
+      if (this.historyWorker) {
+        const purge = () =>
+          getHistory()
+            ?.purge()
+            .then((n) => n && log.info('Purged old job history', { rows: n }))
+            .catch((err) => log.warn('History purge failed', { error: err.message }));
+        this.purgeTimer = setInterval(purge, 6 * 3600 * 1000);
+        this.purgeTimer.unref();
+      }
     }
 
     await this.heartbeat();
     this.heartbeatTimer = setInterval(() => void this.heartbeat(), config.workers.heartbeatIntervalMs);
+    if (this.opts.startWorker !== false) {
+      const reconcile = () => void this.reconcile().catch((err) => log.warn('Reconcile failed', { error: err.message }));
+      setTimeout(reconcile, 15_000).unref();
+      this.reconcileTimer = setInterval(reconcile, RECONCILE_INTERVAL_MS);
+      this.reconcileTimer.unref();
+    }
     this.updateGauges();
     log.info('Worker started', {
       workerId: this.id,
@@ -118,6 +155,27 @@ export class WorkerManager {
   }
 
   async processJob(job: Job<QueuePayload>): Promise<{ status: string; exitCode: number | null }> {
+    try {
+      return await this.runAttempt(job);
+    } catch (err) {
+      if (err instanceof AttemptFailed || err instanceof UnrecoverableError) throw err;
+      // Unexpected infrastructure error (Redis, storage…) after the job started:
+      // record it so the job never stays "running" forever, then let BullMQ retry.
+      const maxAttempts = job.opts.attempts ?? 1;
+      const attempt = Math.min(Math.max(1, job.attemptsMade), maxAttempts);
+      const error = `Internal error: ${err instanceof Error ? err.message : String(err)}`;
+      log.error('Job attempt failed unexpectedly', { jobId: job.data.jobId, attempt, error });
+      try {
+        if (attempt < maxAttempts) await this.store.update(job.data.jobId, { status: 'retrying', error });
+        else await finalizeJob(job.data.jobId, 'failed', { error }, this.store);
+      } catch {
+        /* store unreachable too: the reconciler will repair the record later */
+      }
+      throw err;
+    }
+  }
+
+  private async runAttempt(job: Job<QueuePayload>): Promise<{ status: string; exitCode: number | null }> {
     const jobId = job.data.jobId;
     const record = await this.store.get(jobId);
     if (!record) throw new UnrecoverableError(`Job record ${jobId} not found (expired or deleted)`);
@@ -178,7 +236,26 @@ export class WorkerManager {
 
     await this.store.saveOutput(jobId, { stdout: result.stdout, stderr: result.stderr, truncated: result.truncated });
     const artifacts = result.artifacts ?? [];
-    if (artifacts.length) await this.artifacts.save(jobId, artifacts);
+    // Storage trouble must never hang or fail the job itself.
+    let artifactsError: string | undefined;
+    let storedCount = 0;
+    if (artifacts.length) {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          this.artifacts.save(jobId, artifacts),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('timed out storing artifacts')), ARTIFACT_SAVE_TIMEOUT_MS);
+          }),
+        ]);
+        storedCount = artifacts.length;
+      } catch (err) {
+        artifactsError = `Artifacts could not be stored: ${err instanceof Error ? err.message : String(err)}`;
+        log.error('Failed to store artifacts', { jobId, error: artifactsError });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     const testReport = buildReport({ stdout: result.stdout, artifacts });
 
     // A cancel may have raced with normal completion.
@@ -194,8 +271,9 @@ export class WorkerManager {
       durationMs: result.durationMs,
       error: outcome === 'cancelled' ? 'Cancelled by user' : result.error,
       outputTruncated: result.truncated,
-      artifactCount: artifacts.length,
+      artifactCount: storedCount,
       artifactsTruncated: result.artifactsTruncated ?? false,
+      artifactsError,
       testReport,
     };
 
@@ -217,7 +295,36 @@ export class WorkerManager {
       await this.finish(record, outcome, details);
     }
     // Throwing hands retry/backoff bookkeeping to BullMQ.
-    throw new Error(details.error ?? outcome);
+    throw new AttemptFailed(details.error ?? outcome);
+  }
+
+  /**
+   * Repair records that claim to be queued/running/retrying while their queue
+   * entry is gone or already finished (e.g. a worker crashed between running
+   * the job and recording the result). Safe to run on every worker.
+   */
+  async reconcile(): Promise<number> {
+    const ids = await getRedis().zrevrange(redisKey('jobs', 'all'), 0, config.jobs.maxListScan - 1);
+    const records = await this.store.getMany(ids);
+    const queue = this.opts.queue ?? QueueManager.getInstance();
+    let repaired = 0;
+    for (const r of records) {
+      if (!r || isTerminal(r.status)) continue;
+      if (Date.now() - Date.parse(r.startedAt ?? r.createdAt) < RECONCILE_GRACE_MS) continue;
+      const bull = await queue.getJob(r.id);
+      const state = bull ? await bull.getState() : 'missing';
+      if (!['completed', 'failed', 'missing', 'unknown'].includes(state)) continue;
+      const reason = bull?.failedReason;
+      await finalizeJob(
+        r.id,
+        r.cancelRequested ? 'cancelled' : 'failed',
+        { error: r.cancelRequested ? 'Cancelled by user' : `Job was lost by its worker${reason ? `: ${reason}` : ''}` },
+        this.store
+      );
+      repaired++;
+    }
+    if (repaired) log.warn('Repaired inconsistent job records', { count: repaired });
+    return repaired;
   }
 
   private async finish(
@@ -296,6 +403,9 @@ export class WorkerManager {
     }
 
     await this.webhookWorker?.close().catch(() => undefined);
+    await this.historyWorker?.close().catch(() => undefined);
+    if (this.purgeTimer) clearInterval(this.purgeTimer);
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     await getRedis().del(redisKey('worker', this.id)).catch(() => undefined);
     await this.subscriber?.quit().catch(() => undefined);
     log.info('Worker stopped');

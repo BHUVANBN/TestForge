@@ -68,6 +68,52 @@ describe('WorkerManager.processJob', () => {
     expect(await artifactStore.list(rec.id)).toEqual([{ name: 'junit.xml', size: junit.length }]);
   });
 
+  it('finishes the job even when artifact storage fails', async () => {
+    const rec = makeRecord();
+    await store.create(rec);
+    const broken = new WorkerManager({
+      store,
+      startWorker: false,
+      artifacts: { save: async () => { throw new Error('bucket unreachable'); }, list: async () => [], get: async () => null },
+      executorFactory: () => ({ run: async () => result({ artifacts: [{ name: 'a', data: Buffer.from('x') }] }), kill: async () => undefined }),
+    });
+    await expect(broken.processJob(bullJob(rec.id))).resolves.toEqual({ status: 'completed', exitCode: 0 });
+    expect(await store.get(rec.id)).toMatchObject({
+      status: 'completed',
+      artifactCount: 0,
+      artifactsError: 'Artifacts could not be stored: bucket unreachable',
+    });
+  });
+
+  it('records unexpected infrastructure errors instead of leaving the job running', async () => {
+    const rec = makeRecord();
+    await store.create(rec);
+    const mgr = manager({});
+    const spy = jest.spyOn(store, 'saveOutput').mockRejectedValueOnce(new Error('connect ECONNREFUSED'));
+    await expect(mgr.processJob(bullJob(rec.id))).rejects.toThrow('ECONNREFUSED');
+    spy.mockRestore();
+    expect(await store.get(rec.id)).toMatchObject({ status: 'failed', error: 'Internal error: connect ECONNREFUSED' });
+  });
+
+  it('reconciles records whose queue job is gone or finished', async () => {
+    const old = new Date(Date.now() - 10 * 60_000).toISOString();
+    const lost = makeRecord({ id: '00000000-0000-4000-8000-0000000000a1', status: 'running', startedAt: old, createdAt: old });
+    const active = makeRecord({ id: '00000000-0000-4000-8000-0000000000a2', status: 'running', startedAt: old, createdAt: old });
+    const fresh = makeRecord({ id: '00000000-0000-4000-8000-0000000000a3', status: 'running', startedAt: new Date().toISOString() });
+    const cancelled = makeRecord({ id: '00000000-0000-4000-8000-0000000000a4', status: 'queued', cancelRequested: true, createdAt: old });
+    for (const r of [lost, active, fresh, cancelled]) await store.create(r);
+    const states: Record<string, any> = {
+      [lost.id]: { getState: async () => 'failed', failedReason: 'connect ECONNREFUSED' },
+      [active.id]: { getState: async () => 'active' },
+    };
+    const mgr = new WorkerManager({ store, startWorker: false, queue: { getJob: async (id: string) => states[id] } as any });
+    expect(await mgr.reconcile()).toBe(2);
+    expect(await store.get(lost.id)).toMatchObject({ status: 'failed', error: 'Job was lost by its worker: connect ECONNREFUSED' });
+    expect((await store.get(active.id))?.status).toBe('running');
+    expect((await store.get(fresh.id))?.status).toBe('running');
+    expect((await store.get(cancelled.id))?.status).toBe('cancelled');
+  });
+
   it('never displays more attempts than allowed (re-run after shutdown)', async () => {
     const rec = makeRecord();
     await store.create(rec);

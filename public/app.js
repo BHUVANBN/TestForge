@@ -16,6 +16,7 @@
     pendingRefresh: null,
     lastStatus: null,
     currentBatchId: null,
+    historyPage: 1,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -109,6 +110,7 @@
     if (pageId === 'jobs') loadJobs();
     if (pageId === 'health') loadHealth();
     if (pageId === 'batches') loadBatches();
+    if (pageId === 'history') loadHistory();
   }
 
   // ---------------------------------------------------------------- data
@@ -263,6 +265,99 @@
     });
   }
 
+  function historyDisabled(e) {
+    const off = e && e.status === 404;
+    $('history-disabled').classList.toggle('visible', off);
+    $('history-content').style.display = off ? 'none' : 'block';
+    return off;
+  }
+
+  async function loadHistoryStats() {
+    let s;
+    try {
+      ({ data: s } = await api(`/history/stats?days=${$('h-days').value}`));
+    } catch (e) {
+      historyDisabled(e);
+      return false;
+    }
+    historyDisabled(null);
+    const t = s.totals;
+    $('h-total').textContent = String(t.total);
+    $('h-window').textContent = `last ${s.days} days`;
+    $('h-rate').textContent = t.successRate === null ? '-' : `${t.successRate}%`;
+    $('h-breakdown').textContent = `${t.failed} failed · ${t.timeout} timeout · ${t.cancelled} cancelled`;
+    $('h-avg').textContent = fmtDuration(t.avgDurationMs);
+    $('h-p95').textContent = t.p95DurationMs === null ? '' : `p95 ${fmtDuration(t.p95DurationMs)}`;
+    $('h-tests').textContent = t.testsTotal ? `${t.testsTotal - t.testsFailed}/${t.testsTotal}` : '-';
+    $('h-tests-note').textContent = t.testsTotal ? `${t.testsFailed} failed` : 'from JUnit/TAP reports';
+
+    const max = Math.max(1, ...s.daily.map((d) => d.total));
+    $('h-chart').replaceChildren(
+      ...s.daily.map((d) => {
+        const bar = el('div', { className: 'trend-bar', title: `${d.day}: ${d.completed} completed, ${d.unsuccessful} other` });
+        const ok = el('span', { className: 'ok' });
+        ok.style.height = `${(d.completed / max) * 100}%`;
+        const bad = el('span', { className: 'bad' });
+        bad.style.height = `${(d.unsuccessful / max) * 100}%`;
+        bar.append(ok, bad);
+        return bar;
+      })
+    );
+
+    const failing = $('h-failing');
+    failing.replaceChildren();
+    if (!s.topFailingTests.length) failing.textContent = 'No test failures recorded.';
+    s.topFailingTests.forEach((f) =>
+      failing.appendChild(
+        el('div', { className: 'failure-item' }, [
+          el('span', { className: 'mono', text: `${f.failures}× ` }),
+          document.createTextNode(`${f.classname ? `${f.classname} › ` : ''}${f.name}`),
+        ])
+      )
+    );
+    return true;
+  }
+
+  async function loadHistoryJobs() {
+    const qs = new URLSearchParams({ page: String(state.historyPage), limit: '20' });
+    if ($('h-q').value.trim()) qs.set('q', $('h-q').value.trim());
+    if ($('h-status').value) qs.set('status', $('h-status').value);
+    if ($('h-since').value) qs.set('from', new Date(Date.now() - Number($('h-since').value) * 86400000).toISOString());
+    const tbody = $('h-tbody');
+    let data;
+    try {
+      ({ data } = await api(`/history/jobs?${qs}`));
+    } catch (e) {
+      if (!historyDisabled(e)) tbody.replaceChildren(emptyRow(7, `Search failed: ${e.message}`));
+      return;
+    }
+    tbody.replaceChildren();
+    if (!data.jobs.length) tbody.appendChild(emptyRow(7, 'No matching jobs'));
+    data.jobs.forEach((job) => {
+      const idCell = el('td', { className: 'mono', text: `${job.jobId.slice(0, 8)}…`, title: job.jobId, dataset: { attach: job.jobId } });
+      idCell.style.cursor = 'pointer';
+      tbody.appendChild(
+        el('tr', null, [
+          idCell,
+          el('td', { title: job.error || '' }, [badge(job.status)]),
+          el('td', { className: 'mono', text: job.language || job.command || '-' }),
+          testsCell(job.tests),
+          el('td', { className: 'mono', text: job.exitCode === null ? '-' : job.exitCode }),
+          el('td', { className: 'mono', text: fmtDuration(job.duration) }),
+          el('td', { className: 'muted', text: fmtTime(job.submittedAt, true) }),
+        ])
+      );
+    });
+    const p = data.pagination;
+    $('h-page-label').textContent = `Page ${p.page} of ${Math.max(1, p.pages)} (${p.total} jobs)`;
+    $('h-prev').disabled = p.page <= 1;
+    $('h-next').disabled = p.page >= p.pages;
+  }
+
+  async function loadHistory() {
+    if (await loadHistoryStats()) await loadHistoryJobs();
+  }
+
   async function loadHealth() {
     const grid = $('health-grid');
     let data;
@@ -373,6 +468,7 @@
         )
       );
     }
+    if (job.artifactsError) box.appendChild(el('div', { className: 'extras-row tests-fail', text: job.artifactsError }));
     if (job.artifactCount) {
       const { data } = await api(`/jobs/${jobId}/artifacts`);
       const row = el('div', { className: 'extras-row' }, [el('strong', { text: 'Artifacts: ' })]);
@@ -588,6 +684,25 @@
     $('btn-attach').addEventListener('click', () => attach($('input-stream-id').value.trim()));
     $('btn-cancel-job').addEventListener('click', () => cancelJob($('input-stream-id').value.trim()));
     $('btn-clear').addEventListener('click', () => $('terminal-output').replaceChildren());
+    $('h-days').addEventListener('change', loadHistoryStats);
+    $('h-search').addEventListener('click', () => {
+      state.historyPage = 1;
+      loadHistoryJobs();
+    });
+    $('h-q').addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        state.historyPage = 1;
+        loadHistoryJobs();
+      }
+    });
+    $('h-prev').addEventListener('click', () => {
+      state.historyPage = Math.max(1, state.historyPage - 1);
+      loadHistoryJobs();
+    });
+    $('h-next').addEventListener('click', () => {
+      state.historyPage += 1;
+      loadHistoryJobs();
+    });
     $('filter-status').addEventListener('change', () => {
       state.page = 1;
       loadJobs();

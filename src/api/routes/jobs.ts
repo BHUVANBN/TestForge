@@ -1,12 +1,21 @@
 import { NextFunction, Request, RequestHandler, Response, Router } from 'express';
 import { detail, getJobService, JobError, JobService, parseSubmission, summarize } from '../../jobs/service';
 import { asyncHandler } from '../util';
-import { ArtifactStore, getArtifactStore } from '../../jobs/artifacts';
+import { ArtifactRepository, getArtifactStore } from '../../jobs/artifacts';
+
+/** Report artifact-storage outages as 503 rather than a generic 500. */
+async function storage<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    throw new JobError(503, 'Artifact storage is temporarily unavailable', [err instanceof Error ? err.message : String(err)]);
+  }
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function createJobsRouter(
-  opts: { service?: JobService; submitLimiter?: RequestHandler; artifacts?: ArtifactStore } = {}
+  opts: { service?: JobService; submitLimiter?: RequestHandler; artifacts?: ArtifactRepository } = {}
 ): Router {
   const router = Router();
   const svc = () => opts.service ?? getJobService();
@@ -108,10 +117,8 @@ export function createJobsRouter(
     '/jobs/:jobId/artifacts',
     asyncHandler(async (req, res) => {
       const record = await svc().get(req.params.jobId, req.principal!);
-      res.json({
-        success: true,
-        data: { artifacts: await artifacts().list(record.id), truncated: record.artifactsTruncated ?? false },
-      });
+      const list = await storage(() => artifacts().list(record.id));
+      res.json({ success: true, data: { artifacts: list, truncated: record.artifactsTruncated ?? false } });
     })
   );
 
@@ -122,22 +129,21 @@ export function createJobsRouter(
       const jobId = req.params[0];
       const name = req.params[1]; // already URL-decoded by Express
       const record = await svc().get(jobId, req.principal!);
-      const file = await artifacts().get(record.id, name);
+      const file = await storage(() => artifacts().get(record.id, name));
       if (!file) {
         res.status(404).json({ success: false, error: 'Artifact not found' });
         return;
       }
       const filename = (name.split('/').pop() || 'artifact').replace(/[^\w.-]/g, '_');
       // Always a download, never rendered: artifacts are untrusted job output.
-      res
-        .status(200)
-        .set({
-          'Content-Type': 'application/octet-stream',
-          'Content-Disposition': `attachment; filename="${filename}"`,
-          'Content-Length': String(file.data.length),
-          'Cache-Control': 'private, no-store',
-        })
-        .end(file.data);
+      res.status(200).set({
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Length': String(file.meta.size),
+        'Cache-Control': 'private, no-store',
+      });
+      file.stream.on('error', (err) => res.destroy(err));
+      file.stream.pipe(res);
     })
   );
 

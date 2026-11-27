@@ -59,6 +59,8 @@ export interface JobRecord extends JobSpec {
   testReport?: TestReport;
   artifactCount?: number;
   artifactsTruncated?: boolean;
+  /** Set when artifacts were produced but could not be stored. */
+  artifactsError?: string;
 }
 
 export interface TestFailure {

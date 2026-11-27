@@ -500,3 +500,13 @@ tr:hover td {
 .failure-item { font-size: 13px; margin: 6px 0; }
 .failure-item .mono { color: var(--error); }
 .status-queued.batch, .status-running.batch { }
+
+/* --- History trend chart --- */
+.trend-chart { display: flex; align-items: flex-end; gap: 3px; height: 160px; margin: 16px 0 8px; }
+.trend-bar { flex: 1; display: flex; flex-direction: column-reverse; min-width: 2px; height: 100%; }
+.trend-bar span { display: block; width: 100%; }
+.trend-bar .ok { background: var(--success); border-radius: 0 0 2px 2px; }
+.trend-bar .bad { background: var(--error); opacity: 0.8; border-radius: 2px 2px 0 0; }
+.legend { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin: 0 4px 0 12px; vertical-align: middle; }
+.legend.ok { background: var(--success); margin-left: 0; }
+.legend.bad { background: var(--error); }

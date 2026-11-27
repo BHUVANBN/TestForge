@@ -2,6 +2,7 @@ import { Router } from 'express';
 import os from 'os';
 import config from '../../config';
 import { finalizeJob } from '../../jobs/lifecycle';
+import { getHistory, HistoryStore } from '../../history';
 import { getJobStore, JobStore } from '../../jobs/store';
 import QueueManager from '../../queue/manager';
 import { redisHealthy } from '../../queue/redis';
@@ -21,6 +22,7 @@ export interface SystemDeps {
   store?: () => JobStore;
   redisHealthy?: () => Promise<boolean>;
   listWorkers?: () => Promise<WorkerHeartbeat[]>;
+  history?: () => HistoryStore | null;
 }
 
 const resolve = (deps: SystemDeps) => ({
@@ -28,6 +30,7 @@ const resolve = (deps: SystemDeps) => ({
   store: deps.store ?? getJobStore,
   redisHealthy: deps.redisHealthy ?? redisHealthy,
   listWorkers: deps.listWorkers ?? (() => listWorkers()),
+  history: deps.history ?? getHistory,
 });
 
 export function aggregateWorkers(workers: WorkerHeartbeat[]): WorkerStats {
@@ -59,7 +62,8 @@ export function createHealthRouter(deps: SystemDeps = {}): Router {
         d.listWorkers().catch(() => [] as WorkerHeartbeat[]),
       ]);
       const queue = redis ? await d.queue().ping() : false;
-      const checks = {
+      const history = d.history();
+      const checks: Record<string, { healthy: boolean; message?: string }> = {
         redis: { healthy: redis },
         queue: { healthy: queue },
         workers: {
@@ -67,6 +71,10 @@ export function createHealthRouter(deps: SystemDeps = {}): Router {
           message: workers.length ? `${workers.length} worker(s) online` : 'No workers online: jobs will wait in the queue',
         },
       };
+      if (history) {
+        const ok = await history.ping();
+        checks.history = { healthy: ok, message: ok ? 'Postgres reachable' : 'Postgres unreachable: history writes are queued and retried' };
+      }
       const ready = redis && queue;
       res.status(ready ? 200 : 503).json({
         success: ready,

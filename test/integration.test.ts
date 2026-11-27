@@ -10,6 +10,8 @@ import request from 'supertest';
 import { loadConfig, setConfig } from '../src/config';
 
 const REDIS_URL = process.env.REDIS_TEST_URL;
+const HISTORY_URL = process.env.HISTORY_TEST_DATABASE_URL;
+const S3_ENDPOINT = process.env.S3_TEST_ENDPOINT;
 const describeIf = REDIS_URL ? describe : describe.skip;
 
 describeIf('integration (real Redis + BullMQ)', () => {
@@ -46,6 +48,17 @@ describeIf('integration (real Redis + BullMQ)', () => {
         WEBHOOK_ALLOW_HTTP: 'true',
         WEBHOOK_ALLOW_PRIVATE_NETWORKS: 'true',
         WEBHOOK_SECRET: 'it-secret',
+        ...(HISTORY_URL ? { HISTORY_DATABASE_URL: HISTORY_URL } : {}),
+        ...(S3_ENDPOINT
+          ? {
+              ARTIFACT_STORE: 's3',
+              S3_ENDPOINT,
+              S3_BUCKET: `tf-it-${Date.now()}`,
+              S3_CREATE_BUCKET: 'true',
+              S3_ACCESS_KEY_ID: 'test',
+              S3_SECRET_ACCESS_KEY: 'test',
+            }
+          : {}),
       })
     );
     const redis = await import('../src/queue/redis');
@@ -58,6 +71,13 @@ describeIf('integration (real Redis + BullMQ)', () => {
     setJobStore(new JobStore());
     const { setJobService } = await import('../src/jobs/service');
     setJobService(null);
+    (await import('../src/jobs/artifacts')).setArtifactStore(null);
+    const historyMod = await import('../src/history');
+    historyMod.setHistory(null);
+    if (HISTORY_URL) {
+      await historyMod.getHistory()!.migrate();
+      await (historyMod.getHistory() as any).pool.query('TRUNCATE tf_jobs, tf_batches');
+    }
     const { createApp } = await import('../src/api');
     app = createApp();
     const { WorkerManager } = await import('../src/workers/manager');
@@ -69,6 +89,7 @@ describeIf('integration (real Redis + BullMQ)', () => {
     await worker?.close(2000);
     await QueueManager?.getInstance().close();
     await (await import('../src/webhooks')).closeWebhookQueue();
+    await (await import('../src/history')).closeHistory();
     await new Promise((r) => hookServer.close(r));
     await closeAll?.();
   });
@@ -184,6 +205,24 @@ describeIf('integration (real Redis + BullMQ)', () => {
       await new Promise((r) => setTimeout(r, 100));
     }
     expect(summary).toMatchObject({ status: 'failed', finished: 3, counts: { completed: 2, failed: 1 } });
+  });
+
+  (HISTORY_URL ? it : it.skip)('archives finished jobs to Postgres through the history queue', async () => {
+    const jobId = await submit({ script: 'echo archived', metadata: { suite: 'history-it' }, env: { TOKEN: 'secret' } });
+    await waitFor(jobId, ['completed']);
+    let hist: any;
+    for (let i = 0; i < 50; i++) {
+      const res = await request(app).get('/api/v1/history/jobs?q=history-it').set(key);
+      hist = res.body.data;
+      if (hist?.jobs?.length) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(hist.jobs[0]).toMatchObject({ jobId, status: 'completed', archived: true });
+    const stats = await request(app).get('/api/v1/history/stats?days=1').set(key);
+    expect(stats.body.data.totals.total).toBeGreaterThanOrEqual(1);
+    const row = await (await import('../src/history')).getHistory()!.getJob(jobId);
+    expect(row?.envKeys).toEqual(['TOKEN']);
+    expect(JSON.stringify(row)).not.toContain('secret');
   });
 
   it('reports live workers and queue stats', async () => {

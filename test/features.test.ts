@@ -218,6 +218,17 @@ describe('artifacts and reports API', () => {
   });
 });
 
+describe('artifact storage outages', () => {
+  it('answers 503 instead of a generic 500', async () => {
+    const down = { save: async () => [], list: async () => { throw new Error('connect ECONNREFUSED'); }, get: async () => null };
+    const outageApp = createApp({ jobs, batches, artifacts: down as any, rateLimitStore: 'memory', system: { queue: () => queue as any, store: () => store, listWorkers: async () => [] } });
+    const { body } = await request(outageApp).post('/api/v1/jobs').set(as(USER_KEY)).send({ script: 'true' });
+    const res = await request(outageApp).get(`/api/v1/jobs/${body.data.jobId}/artifacts`).set(as(USER_KEY));
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ error: 'Artifact storage is temporarily unavailable', details: ['connect ECONNREFUSED'] });
+  });
+});
+
 describe('shared rate limiting', () => {
   afterEach(() => {
     setConfig(loadConfig());

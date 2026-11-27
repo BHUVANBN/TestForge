@@ -80,7 +80,27 @@ export interface Config {
     maxJobsPerDay: number;
   };
   batches: { maxJobs: number };
-  artifacts: { maxBytes: number; maxFiles: number };
+  artifacts: {
+    maxBytes: number;
+    maxFiles: number;
+    store: 'redis' | 's3';
+    s3: {
+      bucket?: string;
+      region: string;
+      endpoint?: string;
+      accessKeyId?: string;
+      secretAccessKey?: string;
+      forcePathStyle: boolean;
+      prefix: string;
+      createBucket: boolean;
+    };
+  };
+  history: {
+    /** Postgres connection string; history is disabled when unset. */
+    databaseUrl?: string;
+    ssl: boolean;
+    retentionDays: number;
+  };
   webhooks: {
     secret?: string;
     globalUrls: string[];
@@ -234,6 +254,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     artifacts: {
       maxBytes: int(env.ARTIFACT_MAX_BYTES, 10 * 1024 * 1024),
       maxFiles: int(env.ARTIFACT_MAX_FILES, 50),
+      store: (env.ARTIFACT_STORE || 'redis') as 'redis' | 's3',
+      s3: {
+        bucket: env.S3_BUCKET || undefined,
+        region: env.S3_REGION || 'us-east-1',
+        endpoint: env.S3_ENDPOINT || undefined,
+        accessKeyId: env.S3_ACCESS_KEY_ID || undefined,
+        secretAccessKey: env.S3_SECRET_ACCESS_KEY || undefined,
+        forcePathStyle: bool(env.S3_FORCE_PATH_STYLE, !!env.S3_ENDPOINT),
+        createBucket: bool(env.S3_CREATE_BUCKET, false),
+        prefix: (env.S3_PREFIX ?? 'testforge').replace(/^\/+|\/+$/g, ''),
+      },
+    },
+    history: {
+      databaseUrl: env.HISTORY_DATABASE_URL || undefined,
+      ssl: bool(env.HISTORY_DATABASE_SSL, false),
+      retentionDays: int(env.HISTORY_RETENTION_DAYS, 365),
     },
     webhooks: {
       secret: env.WEBHOOK_SECRET || undefined,
@@ -302,9 +338,14 @@ const schema = Joi.object({
   }),
   batches: Joi.object({ maxJobs: Joi.number().integer().min(1).max(1000) }),
   artifacts: Joi.object({
-    maxBytes: Joi.number().integer().min(0).max(100 * 1024 * 1024),
+    maxBytes: Joi.number().integer().min(0).max(1024 * 1024 * 1024),
     maxFiles: Joi.number().integer().min(0).max(1000),
-  }),
+    store: Joi.string().valid('redis', 's3'),
+  }).unknown(),
+  history: Joi.object({
+    databaseUrl: Joi.string().uri({ scheme: ['postgres', 'postgresql'] }),
+    retentionDays: Joi.number().integer().min(1),
+  }).unknown(),
   webhooks: Joi.object({
     timeoutMs: Joi.number().integer().min(1000),
     maxAttempts: Joi.number().integer().min(1).max(20),
@@ -331,6 +372,12 @@ export function validateConfig(cfg: Config): void {
       problems.push('API keys must be at least 16 characters long');
       break;
     }
+  }
+  if (cfg.artifacts.store === 'redis' && cfg.artifacts.maxBytes > 100 * 1024 * 1024) {
+    problems.push('ARTIFACT_MAX_BYTES above 100 MiB requires ARTIFACT_STORE=s3 (artifacts would live in Redis memory)');
+  }
+  if (cfg.artifacts.store === 's3' && !cfg.artifacts.s3.bucket) {
+    problems.push('ARTIFACT_STORE=s3 requires S3_BUCKET');
   }
   if (cfg.workers.executor === 'local' && cfg.env === 'production' && !cfg.workers.allowUnsafeLocal) {
     problems.push(

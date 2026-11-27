@@ -1,6 +1,7 @@
 import { createLogger } from '../utils/logger';
 import { BatchRecord, JobRecord } from '../utils/types';
 import { enqueueWebhooks } from '../webhooks';
+import { recordHistory } from '../history';
 import { publishBatch, publishStatus } from './events';
 import { getJobStore, JobStore } from './store';
 
@@ -37,6 +38,7 @@ export async function finalizeJob(
 
   await store.releaseActive(record.owner, id).catch(() => undefined);
   await enqueueWebhooks(record.webhookUrl, 'job.finished', { job: jobPayload(record) });
+  await recordHistory({ kind: 'job', record });
 
   if (record.batchId && (await store.recordBatchJobFinished(record.batchId))) {
     await store.updateBatch(record.batchId, { finishedAt: new Date().toISOString() });
@@ -45,6 +47,19 @@ export async function finalizeJob(
       const summary = await batchSummary(batch, store);
       void publishBatch({ batchId: batch.id, owner: batch.owner, status: summary.status });
       await enqueueWebhooks(batch.webhookUrl, 'batch.finished', { batch: summary });
+      await recordHistory({
+        kind: 'batch',
+        batch: {
+          id: batch.id,
+          owner: batch.owner,
+          name: batch.name,
+          status: summary.status,
+          total: batch.total,
+          createdAt: batch.createdAt,
+          finishedAt: summary.finishedAt,
+          summary,
+        },
+      });
       log.info('Batch finished', { batchId: batch.id, status: summary.status });
     }
   }

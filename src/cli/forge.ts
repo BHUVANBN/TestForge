@@ -149,6 +149,8 @@ program
       if (j.batchId) console.log(`   Batch:     ${j.batchId}`);
       if (j.tests) console.log(`   Tests:     ${testLine(j.tests)}`);
       if (j.artifactCount) console.log(`   Artifacts: ${j.artifactCount} (forge artifacts ${j.jobId})`);
+      if (j.artifactsError) console.log(`   ⚠️  ${j.artifactsError}`);
+      if (j.archived) console.log('   (archived: served from long-term history; output is no longer available)');
     } catch (err) {
       fail('Failed to get status', err);
     }
@@ -347,6 +349,70 @@ batch
   });
 
 program
+  .command('history')
+  .description('Search long-term job history (requires history on the server)')
+  .option('-s, --status <status>', 'Filter by status')
+  .option('-q, --query <text>', 'Search command, language, error, metadata or id')
+  .option('--since <duration>', 'Only jobs newer than e.g. 2h, 7d, 4w')
+  .option('-b, --batch <batchId>', 'Only jobs from this batch')
+  .option('-n, --limit <n>', 'Number of jobs', '20')
+  .option('-p, --page <n>', 'Page', '1')
+  .action(async (opts) => {
+    try {
+      const params: Record<string, string> = { limit: opts.limit, page: opts.page };
+      if (opts.status) params.status = opts.status;
+      if (opts.query) params.q = opts.query;
+      if (opts.batch) params.batchId = opts.batch;
+      if (opts.since) params.from = new Date(Date.now() - parseDuration(opts.since)).toISOString();
+      const { data } = await api.get('/history/jobs', { params });
+      if (json()) return console.log(JSON.stringify(data.data, null, 2));
+      const { jobs, pagination } = data.data;
+      if (!jobs.length) return console.log('No matching jobs.');
+      for (const j of jobs) {
+        console.log(
+          `${ICONS[j.status] ?? '•'} ${j.jobId}  ${j.status.padEnd(9)} ${String(j.language ?? j.command).padEnd(8)} ` +
+            `${j.duration !== null ? `${j.duration}ms`.padEnd(8) : '-'.padEnd(8)} ${j.tests ? testLine(j.tests).padEnd(22) : ''.padEnd(22)} ` +
+            new Date(j.submittedAt).toLocaleString()
+        );
+      }
+      console.log(`\nPage ${pagination.page}/${Math.max(1, pagination.pages)}: ${pagination.total} job(s)`);
+    } catch (err) {
+      fail('Failed to search history', err);
+    }
+  });
+
+program
+  .command('stats')
+  .description('Success rate, durations, daily trend and most-failing tests')
+  .option('-d, --days <n>', 'Window in days (1-365)', '30')
+  .action(async (opts) => {
+    try {
+      const { data } = await api.get('/history/stats', { params: { days: opts.days } });
+      const s = data.data;
+      if (json()) return console.log(JSON.stringify(s, null, 2));
+      const t = s.totals;
+      console.log(`📈 Last ${s.days} day(s): ${t.total} jobs`);
+      console.log(`   Success rate: ${t.successRate ?? '-'}%   completed ${t.completed}, failed ${t.failed}, timeout ${t.timeout}, cancelled ${t.cancelled}`);
+      console.log(`   Duration: avg ${t.avgDurationMs ?? '-'}ms, p95 ${t.p95DurationMs ?? '-'}ms`);
+      if (t.testsTotal) console.log(`   Tests: ${t.testsTotal - t.testsFailed}/${t.testsTotal} passed`);
+      const max = Math.max(1, ...s.daily.map((d: any) => d.total));
+      console.log('\n   Daily (█ completed, ░ other):');
+      for (const d of s.daily.slice(-14)) {
+        const width = 30;
+        const ok = Math.round((d.completed / max) * width);
+        const bad = Math.round((d.unsuccessful / max) * width);
+        console.log(`   ${d.day} ${'█'.repeat(ok)}${'░'.repeat(bad)} ${d.total}`);
+      }
+      if (s.topFailingTests.length) {
+        console.log('\n   Most failing tests:');
+        for (const f of s.topFailingTests) console.log(`   ${String(f.failures).padStart(4)}×  ${f.classname ? `${f.classname} › ` : ''}${f.name}`);
+      }
+    } catch (err) {
+      fail('Failed to get stats', err);
+    }
+  });
+
+program
   .command('health')
   .description('Check engine health')
   .action(async () => {
@@ -418,6 +484,16 @@ async function watchBatch(batchId: string): Promise<number> {
     }
     await sleep(1500);
   }
+}
+
+function parseDuration(text: string): number {
+  const m = /^(\d+)\s*([mhdw])$/i.exec(text.trim());
+  if (!m) {
+    console.error(`❌ Invalid duration "${text}" (use e.g. 30m, 12h, 7d, 2w)`);
+    process.exit(1);
+  }
+  const unit = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[m[2].toLowerCase() as 'm' | 'h' | 'd' | 'w'];
+  return Number(m[1]) * unit;
 }
 
 function readFile(file: string): string {

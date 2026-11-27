@@ -19,6 +19,7 @@ import { publishCancel } from './events';
 import { finalizeJob } from './lifecycle';
 import { isReservedEnvName, LANGUAGES } from './runtimes';
 import { getJobStore, JobStore } from './store';
+import { getHistory, HistoryStore } from '../history';
 
 const log = createLogger('jobs');
 
@@ -106,8 +107,13 @@ const BULL_PRIORITY = { high: 1, normal: 2, low: 3 } as const;
 export class JobService {
   constructor(
     private readonly storeOverride?: JobStore,
-    private readonly queueOverride?: QueueManager
+    private readonly queueOverride?: QueueManager,
+    private readonly historyOverride?: HistoryStore | null
   ) {}
+
+  private get history(): HistoryStore | null {
+    return this.historyOverride !== undefined ? this.historyOverride : getHistory();
+  }
 
   private get store(): JobStore {
     return this.storeOverride ?? getJobStore();
@@ -187,7 +193,8 @@ export class JobService {
 
   /** Fetch a job the principal may see; 404 otherwise (don't leak existence). */
   async get(id: string, principal: Principal): Promise<JobRecord> {
-    const record = await this.store.get(id);
+    // Live record first; fall back to long-term history once Redis has expired it.
+    const record = (await this.store.get(id)) ?? (await this.history?.getJob(id).catch(() => null)) ?? null;
     if (!record || (!principal.admin && record.owner !== principal.id)) {
       throw new JobError(404, 'Job not found');
     }
@@ -204,6 +211,7 @@ export class JobService {
   }
 
   async getOutput(id: string, principal: Principal): Promise<{ record: JobRecord; output: JobOutput | null }> {
+    // (Output is kept in Redis only; archived jobs return output: null.)
     const record = await this.get(id, principal);
     return { record, output: await this.store.getOutput(id) };
   }
@@ -255,6 +263,10 @@ export class JobService {
     if (!isTerminal(record.status) || record.status === 'completed') {
       throw new JobError(409, 'Only failed, timed-out or cancelled jobs can be retried');
     }
+    const archived = record as JobRecord & { archived?: boolean; envKeys?: string[] };
+    if (archived.archived && archived.envKeys?.length) {
+      throw new JobError(409, 'This job is archived and its environment values were not retained; submit it again with its env');
+    }
     return this.submit(specOf(record), principal, { retryOf: record.id });
   }
 }
@@ -293,6 +305,7 @@ export function summarize(r: JobRecord) {
     completedAt: r.finishedAt,
     retryOf: r.retryOf,
     batchId: r.batchId,
+    archived: (r as { archived?: boolean }).archived ?? false,
     tests: r.testReport
       ? { total: r.testReport.total, passed: r.testReport.passed, failed: r.testReport.failed, skipped: r.testReport.skipped }
       : undefined,
@@ -307,11 +320,12 @@ export function detail(r: JobRecord) {
     ...summarize(r),
     script: r.script,
     args: r.args,
-    envKeys: Object.keys(r.env ?? {}),
+    envKeys: (r as { envKeys?: string[] }).envKeys ?? Object.keys(r.env ?? {}),
     webhookUrl: r.webhookUrl,
     testReport: r.testReport,
     outputTruncated: r.outputTruncated ?? false,
     artifactsTruncated: r.artifactsTruncated ?? false,
+    artifactsError: r.artifactsError,
     workerId: r.workerId,
   };
 }

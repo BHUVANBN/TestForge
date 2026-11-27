@@ -83,7 +83,10 @@ describe('ArtifactStore', () => {
       { name: 'a.bin', size: 4 },
       { name: 'b.txt', size: 2 },
     ]);
-    expect((await store.get('job-1', 'a.bin'))?.data.equals(bin)).toBe(true);
+    const file = await store.get('job-1', 'a.bin');
+    const chunks: Buffer[] = [];
+    for await (const c of file!.stream) chunks.push(c as Buffer);
+    expect(Buffer.concat(chunks).equals(bin)).toBe(true);
     expect(await store.get('job-1', 'missing')).toBeNull();
   });
 });

@@ -22,6 +22,22 @@ async function main(): Promise<void> {
 
   await waitForRedis();
 
+  const { historyEnabled, getHistory } = await import('./history');
+  if (historyEnabled()) {
+    // Postgres may still be starting; retry for up to ~30s before giving up.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await getHistory()!.migrate();
+        break;
+      } catch (err) {
+        if (attempt >= 15) throw new Error(`Job history database unreachable: ${(err as Error).message}`);
+        log.warn('Waiting for history database', { attempt, error: (err as Error).message });
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    log.info('Job history enabled (Postgres)');
+  }
+
   let api: import('./api').APIServer | null = null;
   let worker: import('./workers/manager').WorkerManager | null = null;
   let metrics: Server | null = null;
@@ -71,6 +87,7 @@ async function main(): Promise<void> {
       const QueueManager = (await import('./queue/manager')).default;
       await QueueManager.getInstance().close().catch(() => undefined);
       await (await import('./webhooks')).closeWebhookQueue().catch(() => undefined);
+      await (await import('./history')).closeHistory().catch(() => undefined);
       await closeAllRedis();
       log.info('Shutdown complete');
     } catch (err) {

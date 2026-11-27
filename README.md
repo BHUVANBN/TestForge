@@ -19,6 +19,9 @@ container on a pool of workers, streams the output live and keeps the result.
   parsing, downloadable artifacts, and signed webhooks when jobs finish.
 - **Observable.** Structured JSON logs, Prometheus metrics, a Grafana
   dashboard, and health and readiness endpoints.
+- **Long-term history.** Every finished job is archived to Postgres, with
+  search, success-rate and duration trends, and a most-failing-tests view.
+  Artifacts can live in S3-compatible storage.
 
 ---
 
@@ -80,7 +83,7 @@ Requires Docker with Compose v2.24 or newer.
 
 ```bash
 ./scripts/init-env.sh             # writes .env with random Redis password + API keys
-docker compose up -d --build      # redis + api + worker
+docker compose up -d --build      # redis + postgres + api + worker
 open http://localhost:3000        # dashboard → "API Key" → paste the user key
 ```
 
@@ -98,6 +101,7 @@ To change the stack:
 ```bash
 docker compose up -d --scale worker=4             # more capacity
 docker compose --profile monitoring up -d         # Prometheus :9090 and Grafana :3001 (localhost only)
+docker compose --profile s3 up -d                 # bundled S3-compatible store (set ARTIFACT_STORE=s3, see .env)
 docker compose logs -f worker                     # JSON logs
 ```
 
@@ -170,6 +174,9 @@ It returns `201 { jobId, status: "queued", submittedAt }`.
 | `POST /batches` | owner | Submit a list of jobs or a test matrix (see [Batches](#batches-and-test-matrices)) |
 | `GET /batches`, `GET /batches/:id` | owner | Batch progress, per-job status, rolled-up test counts |
 | `DELETE /batches/:id` | owner | Cancel every unfinished job in the batch |
+| `GET /history/jobs?q=&status=&batchId=&from=&to=` | owner | Search all archived jobs |
+| `GET /history/stats?days=30` | owner | Totals, success rate, avg/p95 duration, daily trend, most-failing tests |
+| `GET /history/batches` | owner | Archived batches |
 | `DELETE /jobs/:id` | owner | Cancel: `200 cancelled` if it was queued, `202 cancelling` if it's running |
 | `POST /jobs/:id/retry` | owner | Re-run a failed, timed-out or cancelled job as a new job (`retryOf` links them) |
 | `GET /queue/stats` | any key | Queue counts plus aggregated worker capacity |
@@ -265,6 +272,38 @@ time, so DNS rebinding can't get around it. Relax this with
 `WEBHOOK_ALLOW_HTTP` and `WEBHOOK_ALLOW_PRIVATE_NETWORKS` only on trusted
 networks.
 
+### Long-term history
+
+When `HISTORY_DATABASE_URL` points at Postgres (Docker Compose does this
+automatically with its bundled database), every finished job and batch is
+archived there. Writes go through a retried queue, so a database outage delays
+history but never loses it or slows jobs down. Tables are created on startup.
+
+Archived data includes the status, timing, exit code, error, priority, batch,
+metadata, script or command, test report, and the **names** of env vars.
+Env **values** and stdout/stderr are never archived.
+
+- `GET /jobs/:id` (and the CLI and dashboard) keeps working after Redis
+  expires a job, using the archive (marked `archived: true`). Logs are gone by
+  then. Archived jobs can be retried unless they had env vars, because their
+  values weren't kept.
+- Search, stats and trends are in the dashboard's **History & Trends** page,
+  `forge history` and `forge stats`.
+- Rows older than `HISTORY_RETENTION_DAYS` (default 365) are purged
+  automatically.
+
+### Artifact storage
+
+`ARTIFACT_STORE=redis` (the default) needs no extra infrastructure and caps
+artifacts at 100 MiB per job. `ARTIFACT_STORE=s3` stores them in any
+S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, SeaweedFS…) via
+`S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT` and credentials, and allows up to
+1 GiB per job. Downloads stream through the API, so access control still
+applies. S3 objects outlive the Redis TTL, so set a **bucket lifecycle rule**
+to expire `testforge/jobs/*` after however long you want to keep artifacts.
+`docker compose --profile s3` runs a bundled SeaweedFS store on the internal
+network.
+
 ### Quotas and rate limits
 
 Non-admin keys are limited to `QUOTA_MAX_ACTIVE_JOBS` queued or running jobs
@@ -286,6 +325,8 @@ forge report <jobId>                            # test results; exits 1 if any f
 forge artifacts <jobId> [-o ./artifacts]        # list or download
 forge batch run matrix.json --watch             # exit 0 only if every job completed
 forge batch status|watch|cancel <batchId>; forge batch list
+forge history -q checkout --status failed --since 7d   # search the archive
+forge stats --days 30                           # success rate, trend, most failing tests
 forge queue | forge health
 ```
 
@@ -320,6 +361,9 @@ and a list of the problems. The main options:
 | `ARTIFACT_MAX_BYTES` / `ARTIFACT_MAX_FILES` | 10 MiB / `50` | Per-job artifact limits |
 | `WEBHOOK_SECRET` | none | Signs webhook deliveries. Set it. |
 | `RATE_LIMIT_STORE` | `redis` | `memory` makes limits per instance |
+| `HISTORY_DATABASE_URL` | none (Compose: bundled Postgres) | Enables long-term history |
+| `HISTORY_RETENTION_DAYS` | `365` | Archive retention |
+| `ARTIFACT_STORE` | `redis` | `s3` stores artifacts in a bucket (`S3_*` settings) |
 | `METRICS_PORT` | `9100` | Internal port for `/metrics` and `/health`. Don't expose it publicly. |
 
 ## Operations
@@ -342,10 +386,10 @@ and a list of the problems. The main options:
   `forge_jobs_completed_total{status}`, `forge_job_duration_ms`,
   `forge_queue_waiting`, `forge_workers_active`, and
   `forge_http_request_duration_seconds`.
-- **Backups and history:** Redis runs with AOF persistence (the `redis_data`
-  volume). Job history, output and artifacts expire after `JOB_TTL_SECONDS`.
-  For permanent records, point `WEBHOOK_URLS` at a service that stores the
-  `job.finished` payloads, or raise the TTL and size Redis to fit.
+- **Backups and history:** live state is in Redis (AOF persistence, the
+  `redis_data` volume) and expires after `JOB_TTL_SECONDS`. Long-term history
+  is in Postgres (the `postgres_data` volume); back it up like any database,
+  for example with `pg_dump`. Health reports the history database's status.
 - **Artifacts and Redis memory:** artifacts are stored in Redis. Size Redis for
   roughly `ARTIFACT_MAX_BYTES` × jobs per TTL period, or lower the limits.
 - **Custom runtime images** (`RUNTIME_IMAGE_*`) need `sh`, and `tar` for
@@ -364,6 +408,7 @@ src/
   jobs/                 job service (validation, ownership, quotas, cancel/retry), batches,
                         lifecycle (finalize-once), JUnit/TAP reports, artifacts, Redis store, events
   webhooks/             signed, retried, SSRF-guarded webhook delivery
+  history/              Postgres archive: migrations, search, stats, retention
   queue/                Redis connections, BullMQ queue wrapper
   workers/              worker manager (lifecycle, retries, heartbeats), Docker and local executors
   cli/forge.ts          command-line client
