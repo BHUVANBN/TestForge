@@ -17,7 +17,7 @@ export interface Config {
     trustProxy: boolean | number | string;
     corsOrigins: string[];
     bodyLimit: string;
-    rateLimit: { windowMs: number; max: number; submitMax: number };
+    rateLimit: { windowMs: number; max: number; submitMax: number; store: 'redis' | 'memory' };
   };
   metrics: { enabled: boolean; port: number; host: string };
   redis: {
@@ -72,6 +72,22 @@ export interface Config {
     enabled: boolean;
     apiKeys: string[];
     adminApiKeys: string[];
+  };
+  quotas: {
+    /** Max queued + running jobs per API key (0 = unlimited). Admins are exempt. */
+    maxActiveJobs: number;
+    /** Max submissions per API key per UTC day (0 = unlimited). */
+    maxJobsPerDay: number;
+  };
+  batches: { maxJobs: number };
+  artifacts: { maxBytes: number; maxFiles: number };
+  webhooks: {
+    secret?: string;
+    globalUrls: string[];
+    allowHttp: boolean;
+    allowPrivateNetworks: boolean;
+    timeoutMs: number;
+    maxAttempts: number;
   };
   logging: {
     level: string;
@@ -146,6 +162,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         windowMs: int(env.RATE_LIMIT_WINDOW_MS, 60_000),
         max: int(env.RATE_LIMIT_MAX, 600),
         submitMax: int(env.SUBMIT_RATE_LIMIT_MAX, 60),
+        store: (env.RATE_LIMIT_STORE || 'redis') as 'redis' | 'memory',
       },
     },
     metrics: {
@@ -209,6 +226,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       apiKeys: list(env.API_KEYS),
       adminApiKeys: list(env.ADMIN_API_KEYS),
     },
+    quotas: {
+      maxActiveJobs: int(env.QUOTA_MAX_ACTIVE_JOBS, 100),
+      maxJobsPerDay: int(env.QUOTA_MAX_JOBS_PER_DAY, 0),
+    },
+    batches: { maxJobs: int(env.BATCH_MAX_JOBS, 100) },
+    artifacts: {
+      maxBytes: int(env.ARTIFACT_MAX_BYTES, 10 * 1024 * 1024),
+      maxFiles: int(env.ARTIFACT_MAX_FILES, 50),
+    },
+    webhooks: {
+      secret: env.WEBHOOK_SECRET || undefined,
+      globalUrls: list(env.WEBHOOK_URLS),
+      allowHttp: bool(env.WEBHOOK_ALLOW_HTTP, false),
+      allowPrivateNetworks: bool(env.WEBHOOK_ALLOW_PRIVATE_NETWORKS, false),
+      timeoutMs: int(env.WEBHOOK_TIMEOUT, 10_000),
+      maxAttempts: int(env.WEBHOOK_MAX_ATTEMPTS, 8),
+    },
     logging: {
       level: env.LOG_LEVEL || (nodeEnv === 'test' ? 'silent' : 'info'),
       format: (env.LOG_FORMAT || (isProd ? 'json' : 'pretty')) as 'json' | 'pretty',
@@ -229,6 +263,7 @@ const schema = Joi.object({
   server: Joi.object({
     port: Joi.number().port(),
     rateLimit: Joi.object({
+      store: Joi.string().valid('redis', 'memory'),
       windowMs: Joi.number().integer().min(1000),
       max: Joi.number().integer().min(1),
       submitMax: Joi.number().integer().min(1),
@@ -260,6 +295,19 @@ const schema = Joi.object({
   }).unknown(),
   logging: Joi.object({
     format: Joi.string().valid('json', 'pretty'),
+  }).unknown(),
+  quotas: Joi.object({
+    maxActiveJobs: Joi.number().integer().min(0),
+    maxJobsPerDay: Joi.number().integer().min(0),
+  }),
+  batches: Joi.object({ maxJobs: Joi.number().integer().min(1).max(1000) }),
+  artifacts: Joi.object({
+    maxBytes: Joi.number().integer().min(0).max(100 * 1024 * 1024),
+    maxFiles: Joi.number().integer().min(0).max(1000),
+  }),
+  webhooks: Joi.object({
+    timeoutMs: Joi.number().integer().min(1000),
+    maxAttempts: Joi.number().integer().min(1).max(20),
   }).unknown(),
 }).unknown();
 

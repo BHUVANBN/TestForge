@@ -32,6 +32,10 @@
         <i data-lucide="list" class="nav-icon"></i>
         Job History
       </button>
+      <button class="nav-item" id="btn-batches" data-page="batches">
+        <i data-lucide="layers" class="nav-icon"></i>
+        Batches
+      </button>
       <button class="nav-item" id="btn-submit" data-page="submit">
         <i data-lucide="zap" class="nav-icon"></i>
         Run Execution
@@ -162,7 +166,7 @@
         <div class="table-wrapper">
           <table id="full-jobs-table">
             <thead>
-              <tr><th>Job ID</th><th>Status</th><th>Runtime</th><th>Exit</th><th>Duration</th><th>Submitted</th><th>Actions</th></tr>
+              <tr><th>Job ID</th><th>Status</th><th>Runtime</th><th>Tests</th><th>Exit</th><th>Duration</th><th>Submitted</th><th>Actions</th></tr>
             </thead>
             <tbody id="full-jobs-tbody"></tbody>
           </table>
@@ -171,6 +175,29 @@
           <button class="button button-secondary button-small" id="page-prev">Previous</button>
           <span id="page-label">Page 1</span>
           <button class="button button-secondary button-small" id="page-next">Next</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Batches -->
+    <section id="page-batches" class="page fade-in">
+      <h1>Batches</h1>
+      <p class="subhead">Groups of jobs and test matrices submitted with <span class="mono">POST /api/v1/batches</span> or <span class="mono">forge batch run</span>.</p>
+      <div class="card card-span-12">
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Batch ID</th><th>Name</th><th>Status</th><th>Progress</th><th>Tests</th><th>Created</th><th></th></tr></thead>
+            <tbody id="batches-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card card-span-12" id="batch-detail" style="display:none; margin-top:24px">
+        <h2 id="batch-detail-title">Batch</h2>
+        <div class="table-wrapper">
+          <table>
+            <thead><tr><th>Job ID</th><th>Status</th><th>Matrix / Runtime</th><th>Tests</th><th>Exit</th><th>Duration</th></tr></thead>
+            <tbody id="batch-jobs-tbody"></tbody>
+          </table>
         </div>
       </div>
     </section>
@@ -222,7 +249,7 @@
               <textarea class="textarea mono" id="input-env" style="min-height:70px" placeholder="TEST_SUITE=smoke"></textarea>
             </div>
 
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:20px;">
               <div class="form-group">
                 <span class="label">Timeout (ms)</span>
                 <input type="number" class="input" id="input-timeout" value="60000" min="1000">
@@ -231,6 +258,20 @@
                 <span class="label">Retries</span>
                 <input type="number" class="input" id="input-retries" value="0" min="0" max="5">
               </div>
+              <div class="form-group">
+                <span class="label">Priority</span>
+                <select class="select" id="input-priority">
+                  <option value="normal">Normal</option>
+                  <option value="high">High</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <span class="label">Webhook URL (optional)</span>
+              <input type="url" class="input mono" id="input-webhook" placeholder="https://ci.example.com/hooks/testforge">
+              <div class="hint">Receives a signed POST when the job finishes.</div>
             </div>
 
             <button type="submit" class="button button-primary">Dispatch Job</button>
@@ -245,6 +286,8 @@
             <button class="button button-secondary" data-template="python">Python Runtime</button>
             <button class="button button-secondary" data-template="bash">Bash System Check</button>
             <button class="button button-secondary" data-template="failing">Failing Test (exit 1)</button>
+            <button class="button button-secondary" data-template="junit">JUnit Report + Artifacts</button>
+            <button class="button button-secondary" data-template="tap">TAP Output</button>
           </div>
           <div style="margin-top:24px; padding:20px; background:var(--bg-secondary); border-radius:var(--radius-md); font-size:13px; color:var(--text-tertiary);">
             In the default configuration every job runs in a fresh sandbox container with no network access, a read-only filesystem and CPU, memory and process limits.
@@ -272,6 +315,7 @@
           <div class="console" id="terminal-output">
             <div class="console-line">Ready to attach to a job…</div>
           </div>
+          <div id="job-extras" style="margin-top:16px"></div>
         </div>
       </div>
     </section>

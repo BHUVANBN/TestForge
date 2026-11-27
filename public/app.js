@@ -15,6 +15,7 @@
     refreshTimer: null,
     pendingRefresh: null,
     lastStatus: null,
+    currentBatchId: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -40,6 +41,14 @@
 
   function emptyRow(cols, text) {
     return el('tr', null, [el('td', { colSpan: cols, className: 'empty-row', text })]);
+  }
+
+  function testsCell(tests) {
+    if (!tests) return el('td', { className: 'muted', text: '-' });
+    return el('td', {
+      className: `mono ${tests.failed ? 'tests-fail' : 'tests-pass'}`,
+      text: `${tests.passed}/${tests.total}${tests.failed ? ` (${tests.failed} failed)` : ''}`,
+    });
   }
 
   const fmtDuration = (ms) => (ms === null || ms === undefined ? '-' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
@@ -99,6 +108,7 @@
     $(`btn-${pageId}`).classList.add('active');
     if (pageId === 'jobs') loadJobs();
     if (pageId === 'health') loadHealth();
+    if (pageId === 'batches') loadBatches();
   }
 
   // ---------------------------------------------------------------- data
@@ -160,12 +170,12 @@
     try {
       ({ data } = await api(`/jobs?${qs}`));
     } catch (e) {
-      $('full-jobs-tbody').replaceChildren(emptyRow(7, `Could not load jobs: ${e.message}`));
+      $('full-jobs-tbody').replaceChildren(emptyRow(8, `Could not load jobs: ${e.message}`));
       return;
     }
     const tbody = $('full-jobs-tbody');
     tbody.replaceChildren();
-    if (!data.jobs.length) tbody.appendChild(emptyRow(7, 'No execution history found'));
+    if (!data.jobs.length) tbody.appendChild(emptyRow(8, 'No execution history found'));
     data.jobs.forEach((job) => {
       const actions = el('div', { className: 'row-actions' }, [
         el('button', { className: 'button button-secondary button-small', text: 'Logs', dataset: { attach: job.jobId } }),
@@ -180,6 +190,7 @@
           el('td', { className: 'mono', text: job.jobId }),
           el('td', { title: job.error || '' }, [badge(job.status)]),
           el('td', { className: 'mono', text: job.language || job.command || '-' }),
+          testsCell(job.tests),
           el('td', { className: 'mono', text: job.exitCode === null ? '-' : job.exitCode }),
           el('td', { className: 'mono', text: fmtDuration(job.duration) }),
           el('td', { className: 'muted', text: fmtTime(job.submittedAt, true) }),
@@ -191,6 +202,65 @@
     $('page-label').textContent = `Page ${page} of ${Math.max(1, pages)} (${total} jobs)`;
     $('page-prev').disabled = !hasPrev;
     $('page-next').disabled = !hasNext;
+  }
+
+  async function loadBatches() {
+    const tbody = $('batches-tbody');
+    let data;
+    try {
+      ({ data } = await api('/batches?limit=50'));
+    } catch (e) {
+      tbody.replaceChildren(emptyRow(7, `Could not load batches: ${e.message}`));
+      return;
+    }
+    tbody.replaceChildren();
+    if (!data.batches.length) tbody.appendChild(emptyRow(7, 'No batches yet'));
+    data.batches.forEach((b) => {
+      const bar = el('div', { className: 'progress' }, [el('span')]);
+      bar.firstChild.style.width = `${b.total ? Math.round((b.finished / b.total) * 100) : 0}%`;
+      const progress = el('td', { className: 'mono' }, [bar, document.createTextNode(`${b.finished}/${b.total}`)]);
+      tbody.appendChild(
+        el('tr', null, [
+          el('td', { className: 'mono', text: `${b.id.slice(0, 8)}…`, title: b.id }),
+          el('td', { text: b.name || '-' }),
+          el('td', null, [badge(b.status)]),
+          progress,
+          testsCell(b.tests),
+          el('td', { className: 'muted', text: fmtTime(b.createdAt, true) }),
+          el('td', null, [el('button', { className: 'button button-secondary button-small', text: 'Open', dataset: { batch: b.id } })]),
+        ])
+      );
+    });
+    if (state.currentBatchId) loadBatchDetail(state.currentBatchId);
+  }
+
+  async function loadBatchDetail(id) {
+    state.currentBatchId = id;
+    let b;
+    try {
+      ({ data: b } = await api(`/batches/${id}`));
+    } catch (e) {
+      return;
+    }
+    $('batch-detail').style.display = 'block';
+    $('batch-detail-title').textContent = `${b.name || 'Batch'}: ${b.status} (${b.finished}/${b.total})`;
+    const tbody = $('batch-jobs-tbody');
+    tbody.replaceChildren();
+    b.jobs.forEach((j) => {
+      const label = j.matrix ? Object.entries(j.matrix).map(([k, v]) => `${k}=${v}`).join(' ') : j.language || j.command || '-';
+      const idCell = el('td', { className: 'mono', text: j.jobId, dataset: { attach: j.jobId } });
+      idCell.style.cursor = 'pointer';
+      tbody.appendChild(
+        el('tr', null, [
+          idCell,
+          el('td', null, [badge(j.status)]),
+          el('td', { className: 'mono', text: label }),
+          testsCell(j.tests),
+          el('td', { className: 'mono', text: j.exitCode === null ? '-' : j.exitCode }),
+          el('td', { className: 'mono', text: fmtDuration(j.duration) }),
+        ])
+      );
+    });
   }
 
   async function loadHealth() {
@@ -226,6 +296,7 @@
       await Promise.all([loadStats(), loadRecent()]);
       if ($('page-jobs').classList.contains('active')) await loadJobs();
       if ($('page-health').classList.contains('active')) await loadHealth();
+      if ($('page-batches').classList.contains('active')) await loadBatches();
     } catch (e) {
       /* surfaced via banner / status */
     }
@@ -258,19 +329,83 @@
     terminal.scrollTop = terminal.scrollHeight;
   }
 
+  async function downloadArtifact(jobId, name) {
+    const resp = await fetch(`/api/v1/jobs/${jobId}/artifacts/${name.split('/').map(encodeURIComponent).join('/')}`, {
+      headers: apiKey() ? { 'X-API-Key': apiKey() } : {},
+    });
+    if (!resp.ok) return alert(`Download failed (HTTP ${resp.status})`);
+    const url = URL.createObjectURL(await resp.blob());
+    const a = el('a');
+    a.href = url;
+    a.download = name.split('/').pop();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function showExtras(jobId) {
+    const box = $('job-extras');
+    box.replaceChildren();
+    let job;
+    try {
+      ({ data: job } = await api(`/jobs/${jobId}`));
+    } catch (_) {
+      return;
+    }
+    if (job.testReport) {
+      const r = job.testReport;
+      box.appendChild(
+        el('div', { className: 'extras-row' }, [
+          el('strong', { text: `Tests (${r.format.toUpperCase()}): ` }),
+          el('span', {
+            className: r.failed ? 'tests-fail' : 'tests-pass',
+            text: `${r.passed}/${r.total} passed${r.failed ? `, ${r.failed} failed` : ''}${r.skipped ? `, ${r.skipped} skipped` : ''}`,
+          }),
+        ])
+      );
+      r.failures.slice(0, 10).forEach((f) =>
+        box.appendChild(
+          el('div', { className: 'failure-item' }, [
+            el('span', { className: 'mono', text: `✗ ${f.classname ? `${f.classname} › ` : ''}${f.name}` }),
+            f.message ? el('div', { className: 'muted', text: f.message.split('\n')[0] }) : null,
+          ])
+        )
+      );
+    }
+    if (job.artifactCount) {
+      const { data } = await api(`/jobs/${jobId}/artifacts`);
+      const row = el('div', { className: 'extras-row' }, [el('strong', { text: 'Artifacts: ' })]);
+      data.artifacts.forEach((a) =>
+        row.appendChild(
+          el('button', {
+            className: 'button button-secondary button-small',
+            text: `${a.name} (${a.size < 1024 ? `${a.size} B` : `${(a.size / 1024).toFixed(1)} KB`})`,
+            dataset: { artifactJob: jobId, artifactName: a.name },
+          })
+        )
+      );
+      box.appendChild(row);
+    }
+  }
+
   async function attach(jobId) {
     if (!jobId) return;
     if (state.currentJobId && state.socket) state.socket.emit('unsubscribe-job', state.currentJobId);
     state.currentJobId = jobId;
+    state.lastStatus = null;
     $('input-stream-id').value = jobId;
     showPage('stream');
     $('terminal-output').replaceChildren();
+    $('job-extras').replaceChildren();
     logLine('info', `Attached to job ${jobId}`);
 
     // Print what has been recorded so far, then follow live output.
     try {
       const { data: job } = await api(`/jobs/${jobId}`);
-      logLine('info', `Status: ${job.status}${job.attempt ? ` (attempt ${job.attempt}/${job.maxAttempts})` : ''}`);
+      if (state.lastStatus !== job.status) {
+        logLine('info', `Status: ${job.status}${job.attempt ? ` (attempt ${job.attempt}/${job.maxAttempts})` : ''}`);
+      }
       state.lastStatus = job.status;
       if (TERMINAL.has(job.status)) {
         const { data } = await api(`/logs/${jobId}`);
@@ -278,6 +413,7 @@
         if (data.logs.stderr) writeOutput('stderr', data.logs.stderr);
         if (data.truncated) logLine('error', 'Output was truncated by the server limit');
         finalLine(job);
+        showExtras(jobId);
       }
     } catch (e) {
       logLine('error', e.status === 404 ? 'Job not found' : `Failed to load job: ${e.message}`);
@@ -324,10 +460,14 @@
       if (e.jobId !== state.currentJobId) return;
       if (e.status === state.lastStatus && !TERMINAL.has(e.status)) return;
       state.lastStatus = e.status;
-      if (TERMINAL.has(e.status)) finalLine(e);
+      if (TERMINAL.has(e.status)) {
+        finalLine(e);
+        showExtras(e.jobId);
+      }
       else logLine('info', `Status: ${e.status}${e.attempt ? ` (attempt ${e.attempt})` : ''}${e.error ? `: ${e.error}` : ''}`);
     });
     socket.on('job-error', (e) => logLine('error', e.error));
+    socket.on('batch-status', () => scheduleRefresh());
   }
 
   // ---------------------------------------------------------------- actions
@@ -359,8 +499,10 @@
     const payload = {
       timeout: parseInt($('input-timeout').value, 10),
       retries: parseInt($('input-retries').value, 10) || 0,
+      priority: $('input-priority').value,
       metadata: { source: 'dashboard' },
     };
+    if ($('input-webhook').value.trim()) payload.webhookUrl = $('input-webhook').value.trim();
     try {
       const env = parseEnv($('input-env').value);
       if (Object.keys(env).length) payload.env = env;
@@ -407,6 +549,11 @@
     python: ['python', "import platform, sys\nprint(f'Python {sys.version.split()[0]} on {platform.system()} {platform.release()}')\nprint('Execution complete.')"],
     bash: ['bash', "echo 'Running system checks...'\nuname -a\ndf -h /workspace\necho 'Test cycle complete.'"],
     failing: ['bash', "echo 'Running assertions...'\necho 'expected 2, got 3' >&2\nexit 1"],
+    junit: [
+      'python',
+      "import os\n# Anything written to $TESTFORGE_ARTIFACTS is kept and downloadable.\nout = os.environ['TESTFORGE_ARTIFACTS']\nwith open(os.path.join(out, 'junit.xml'), 'w') as f:\n    f.write('<testsuite name=\"demo\"><testcase classname=\"demo\" name=\"adds\" time=\"0.01\"/>'\n            '<testcase classname=\"demo\" name=\"divides\"><failure message=\"ZeroDivisionError\"/></testcase></testsuite>')\nwith open(os.path.join(out, 'summary.txt'), 'w') as f:\n    f.write('1 passed, 1 failed\\n')\nprint('wrote junit.xml and summary.txt')",
+    ],
+    tap: ['bash', "echo 'TAP version 13'\necho '1..3'\necho 'ok 1 - starts up'\necho 'ok 2 - reads config'\necho 'ok 3 - optional check # SKIP no network'"],
   };
 
   function loadTemplate(name) {
@@ -456,9 +603,11 @@
 
     // Delegated row actions
     document.addEventListener('click', (ev) => {
-      const t = ev.target.closest('[data-attach],[data-retry],[data-cancel]');
+      const t = ev.target.closest('[data-attach],[data-retry],[data-cancel],[data-batch],[data-artifact-job]');
       if (!t) return;
-      if (t.dataset.attach) attach(t.dataset.attach);
+      if (t.dataset.artifactJob) downloadArtifact(t.dataset.artifactJob, t.dataset.artifactName);
+      else if (t.dataset.batch) loadBatchDetail(t.dataset.batch);
+      else if (t.dataset.attach) attach(t.dataset.attach);
       else if (t.dataset.retry) retryJob(t.dataset.retry);
       else if (t.dataset.cancel) cancelJob(t.dataset.cancel);
     });

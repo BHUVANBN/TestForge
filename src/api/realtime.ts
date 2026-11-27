@@ -1,6 +1,6 @@
 import type Redis from 'ioredis';
 import { Server as SocketIOServer, Socket } from 'socket.io';
-import { channels, LogEvent, StatusEvent } from '../jobs/events';
+import { BatchEvent, channels, LogEvent, StatusEvent } from '../jobs/events';
 import { getJobService, JobService, summarize } from '../jobs/service';
 import { createRedis } from '../queue/redis';
 import { createLogger } from '../utils/logger';
@@ -14,7 +14,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * Socket.IO protocol
  *  client → server: subscribe-job(jobId), unsubscribe-job(jobId)
  *  server → client: job-state {job}, job-status {StatusEvent}, job-log {jobId, stream, data},
- *                   job-error {jobId, error}
+ *                   job-error {jobId, error}, batch-status {batchId, status}
  * Clients authenticate with `io({ auth: { apiKey } })`.
  */
 export function attachRealtime(
@@ -58,7 +58,7 @@ export function attachRealtime(
   });
 
   const subscriber = opts.subscriber ?? createRedis('api-events-sub');
-  void subscriber.subscribe(channels.status(), channels.logs()).catch((err) =>
+  void subscriber.subscribe(channels.status(), channels.logs(), channels.batch()).catch((err) =>
     log.error('Failed to subscribe to job events', { error: err.message })
   );
   subscriber.on('message', (channel: string, message: string) => {
@@ -69,6 +69,9 @@ export function attachRealtime(
       } else if (channel === channels.logs()) {
         const e = JSON.parse(message) as LogEvent;
         io.to(`job:${e.jobId}`).emit('job-log', { jobId: e.jobId, stream: e.stream, data: e.data });
+      } else if (channel === channels.batch()) {
+        const e = JSON.parse(message) as BatchEvent;
+        io.to(`owner:${e.owner}`).to('admins').emit('batch-status', e);
       }
     } catch {
       /* ignore malformed */

@@ -10,7 +10,14 @@ export const channels = {
   status: () => redisKey('events', 'status'),
   logs: () => redisKey('events', 'logs'),
   cancel: () => redisKey('events', 'cancel'),
+  batch: () => redisKey('events', 'batch'),
 };
+
+export interface BatchEvent {
+  batchId: string;
+  owner: string;
+  status: string;
+}
 
 export interface StatusEvent {
   jobId: string;
@@ -39,3 +46,4 @@ const publish = (client: Redis, channel: string, payload: object) =>
 export const publishStatus = (e: StatusEvent, client: Redis = getRedis()) => publish(client, channels.status(), e);
 export const publishLog = (e: LogEvent, client: Redis = getRedis()) => publish(client, channels.logs(), e);
 export const publishCancel = (e: CancelEvent, client: Redis = getRedis()) => publish(client, channels.cancel(), e);
+export const publishBatch = (e: BatchEvent, client: Redis = getRedis()) => publish(client, channels.batch(), e);

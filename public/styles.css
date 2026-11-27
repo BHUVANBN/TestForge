@@ -491,3 +491,12 @@ tr:hover td {
 }
 .banner.visible { display: block; }
 .pager { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 16px; font-size: 13px; }
+
+.progress { height: 6px; width: 120px; background: var(--bg-secondary); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 8px; }
+.progress > span { display: block; height: 100%; background: var(--accent); }
+.tests-pass { color: var(--success); }
+.tests-fail { color: var(--error); }
+.extras-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.failure-item { font-size: 13px; margin: 6px 0; }
+.failure-item .mono { color: var(--error); }
+.status-queued.batch, .status-running.batch { }

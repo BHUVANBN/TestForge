@@ -39,10 +39,10 @@ export function makeRecord(overrides: Partial<JobRecord> = {}): JobRecord {
 
 /** Minimal in-memory stand-in for QueueManager. */
 export class FakeQueue {
-  jobs = new Map<string, { state: string; attempts: number }>();
+  jobs = new Map<string, { state: string; attempts: number; priority?: number }>();
   paused = false;
-  async add(jobId: string, attempts: number) {
-    this.jobs.set(jobId, { state: 'waiting', attempts });
+  async add(jobId: string, attempts: number, priority?: number) {
+    this.jobs.set(jobId, { state: 'waiting', attempts, priority });
     return { id: jobId } as any;
   }
   async getJob(jobId: string) {
@@ -73,3 +73,33 @@ export class FakeQueue {
     return true;
   }
 }
+
+/** Build a tar archive the way `docker cp` returns it (top-level "artifacts/"). */
+export function makeTar(files: Record<string, string | Buffer>, root = 'artifacts/'): Buffer {
+  const blocks: Buffer[] = [];
+  const header = (name: string, size: number, type: string) => {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100);
+    h.write('0000644\0', 100);
+    h.write('0000000\0', 108);
+    h.write('0000000\0', 116);
+    h.write(size.toString(8).padStart(11, '0') + '\0', 124);
+    h.write('00000000000\0', 136);
+    h.write('        ', 148);
+    h.write(type, 156);
+    h.write('ustar\0' + '00', 257);
+    let sum = 0;
+    for (const b of h) sum += b;
+    h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+    return h;
+  };
+  blocks.push(header(root, 0, '5'));
+  for (const [name, content] of Object.entries(files)) {
+    const data = Buffer.isBuffer(content) ? content : Buffer.from(content);
+    blocks.push(header(`${root}${name}`, data.length, '0'));
+    blocks.push(data, Buffer.alloc((512 - (data.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return Buffer.concat(blocks);
+}
+

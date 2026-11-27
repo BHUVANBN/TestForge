@@ -70,6 +70,7 @@ async function main(): Promise<void> {
       await new Promise<void>((r) => (metrics ? metrics.close(() => r()) : r()));
       const QueueManager = (await import('./queue/manager')).default;
       await QueueManager.getInstance().close().catch(() => undefined);
+      await (await import('./webhooks')).closeWebhookQueue().catch(() => undefined);
       await closeAllRedis();
       log.info('Shutdown complete');
     } catch (err) {

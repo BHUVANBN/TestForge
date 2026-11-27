@@ -17,6 +17,9 @@ const result = (overrides: Partial<ExecutionResult> = {}): ExecutionResult => ({
   ...overrides,
 });
 
+import { ArtifactStore } from '../src/jobs/artifacts';
+const artifactStore = new ArtifactStore(redis);
+
 function manager(
   outcome: Partial<ExecutionResult> | (() => Promise<ExecutionResult>),
   seen: JobRecord[] = [],
@@ -25,6 +28,7 @@ function manager(
   return new WorkerManager({
     store,
     startWorker: false,
+    artifacts: artifactStore,
     connect: () => (redis as any).duplicate(),
     executorFactory: (record) => {
       seen.push(record);
@@ -52,6 +56,24 @@ describe('WorkerManager.processJob', () => {
     expect(await store.get(rec.id)).toMatchObject({ status: 'completed', exitCode: 0, durationMs: 42, attempt: 1 });
     expect((await store.get(rec.id))?.finishedAt).toBeDefined();
     expect(await store.getOutput(rec.id)).toEqual({ stdout: 'hello\n', stderr: '', truncated: false });
+  });
+
+  it('stores artifacts and the parsed test report', async () => {
+    const rec = makeRecord();
+    await store.create(rec);
+    const junit = '<testsuite><testcase name="a"/><testcase name="b"><failure message="nope"/></testcase></testsuite>';
+    await manager({ artifacts: [{ name: 'junit.xml', data: Buffer.from(junit) }] }).processJob(bullJob(rec.id));
+    const saved = await store.get(rec.id);
+    expect(saved).toMatchObject({ status: 'completed', artifactCount: 1, testReport: { format: 'junit', total: 2, failed: 1 } });
+    expect(await artifactStore.list(rec.id)).toEqual([{ name: 'junit.xml', size: junit.length }]);
+  });
+
+  it('never displays more attempts than allowed (re-run after shutdown)', async () => {
+    const rec = makeRecord();
+    await store.create(rec);
+    const seen: JobRecord[] = [];
+    await manager({}, seen).processJob(bullJob(rec.id, 2, 1));
+    expect(seen[0].attempt).toBe(1);
   });
 
   it('marks retrying and throws so BullMQ retries', async () => {

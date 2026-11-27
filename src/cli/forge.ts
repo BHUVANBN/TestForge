@@ -76,6 +76,8 @@ program
   .option('-t, --timeout <ms>', 'Timeout in milliseconds')
   .option('-r, --retries <n>', 'Retries after a failed attempt')
   .option('-m, --metadata <json>', 'Metadata JSON object')
+  .option('-p, --priority <level>', 'high, normal or low')
+  .option('--webhook <url>', 'POST the result to this URL when the job finishes')
   .option('-w, --watch', 'Wait for the job, print its output and exit with its status')
   .action(async (opts) => {
     const payload: Record<string, unknown> = {};
@@ -92,6 +94,8 @@ program
     }
     if (opts.timeout) payload.timeout = parseInt(opts.timeout, 10);
     if (opts.retries) payload.retries = parseInt(opts.retries, 10);
+    if (opts.priority) payload.priority = opts.priority;
+    if (opts.webhook) payload.webhookUrl = opts.webhook;
     if (opts.env) {
       payload.env = Object.fromEntries(
         (opts.env as string[]).map((kv) => {
@@ -141,6 +145,10 @@ program
       if (j.duration !== null) console.log(`   Duration:  ${j.duration}ms`);
       if (j.error) console.log(`   Error:     ${j.error}`);
       if (j.retryOf) console.log(`   Retry of:  ${j.retryOf}`);
+      if (j.priority !== 'normal') console.log(`   Priority:  ${j.priority}`);
+      if (j.batchId) console.log(`   Batch:     ${j.batchId}`);
+      if (j.tests) console.log(`   Tests:     ${testLine(j.tests)}`);
+      if (j.artifactCount) console.log(`   Artifacts: ${j.artifactCount} (forge artifacts ${j.jobId})`);
     } catch (err) {
       fail('Failed to get status', err);
     }
@@ -217,6 +225,128 @@ program
   .action(async (jobId) => process.exit(await watch(jobId)));
 
 program
+  .command('report <jobId>')
+  .description('Show the parsed JUnit/TAP test report of a job')
+  .action(async (jobId) => {
+    try {
+      const { data } = await api.get(`/jobs/${jobId}/report`);
+      const r = data.data;
+      if (json()) return console.log(JSON.stringify(r, null, 2));
+      if (!r) return console.log('No test report: write JUnit XML to $TESTFORGE_ARTIFACTS or print TAP to stdout.');
+      console.log(`🧪 ${r.format.toUpperCase()} (${r.sources.join(', ')}): ${testLine(r)}`);
+      for (const f of r.failures) {
+        console.log(`   ❌ ${f.classname ? `${f.classname} › ` : ''}${f.name}`);
+        if (f.message) console.log(`      ${f.message.split('\n')[0]}`);
+      }
+      process.exit(r.failed > 0 ? 1 : 0);
+    } catch (err) {
+      fail('Failed to get report', err);
+    }
+  });
+
+program
+  .command('artifacts <jobId>')
+  .description('List a job\'s artifacts, or download them with --out')
+  .option('-o, --out <dir>', 'Download all artifacts into this directory')
+  .option('-n, --name <name>', 'Only this artifact')
+  .action(async (jobId, opts) => {
+    try {
+      const { data } = await api.get(`/jobs/${jobId}/artifacts`);
+      const list: { name: string; size: number }[] = data.data.artifacts.filter((a: any) => !opts.name || a.name === opts.name);
+      if (json() && !opts.out) return console.log(JSON.stringify(data.data, null, 2));
+      if (!list.length) return console.log('No artifacts.');
+      if (!opts.out) {
+        list.forEach((a) => console.log(`${String(a.size).padStart(10)}  ${a.name}`));
+        if (data.data.truncated) console.error('(some artifacts were dropped by the server size/count limit)');
+        return;
+      }
+      const root = path.resolve(opts.out);
+      for (const a of list) {
+        const target = path.resolve(root, a.name);
+        if (!target.startsWith(root + path.sep)) continue; // never write outside --out
+        const res = await api.get(`/jobs/${jobId}/artifacts/${a.name.split('/').map(encodeURIComponent).join('/')}`, {
+          responseType: 'arraybuffer',
+        });
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, Buffer.from(res.data));
+        console.log(`⬇️  ${path.relative(process.cwd(), target)}`);
+      }
+    } catch (err) {
+      fail('Failed to get artifacts', err);
+    }
+  });
+
+const batch = program.command('batch').description('Run and inspect batches of jobs (lists or matrices)');
+
+batch
+  .command('run <file>')
+  .description('Submit a batch from a JSON file: {"jobs":[...]} or {"matrix":{"base":{...},"axes":{...}}}')
+  .option('-w, --watch', 'Wait for all jobs; exit 0 only if every job completed')
+  .action(async (file, opts) => {
+    let body: unknown;
+    try {
+      body = JSON.parse(file === '-' ? fs.readFileSync(0, 'utf8') : readFile(file));
+    } catch {
+      console.error('❌ Batch file must be valid JSON');
+      process.exit(1);
+    }
+    try {
+      const { data } = await api.post('/batches', body);
+      if (json() && !opts.watch) return console.log(JSON.stringify(data.data));
+      console.error(`✅ Batch submitted: ${data.data.batchId} (${data.data.total} jobs)`);
+      if (opts.watch) process.exit(await watchBatch(data.data.batchId));
+    } catch (err) {
+      fail('Failed to submit batch', err);
+    }
+  });
+
+batch
+  .command('status <batchId>')
+  .description('Show a batch and its jobs')
+  .action(async (batchId) => {
+    try {
+      const { data } = await api.get(`/batches/${batchId}`);
+      if (json()) return console.log(JSON.stringify(data.data, null, 2));
+      printBatch(data.data);
+    } catch (err) {
+      fail('Failed to get batch', err);
+    }
+  });
+
+batch
+  .command('watch <batchId>')
+  .description('Wait for a batch to finish')
+  .action(async (batchId) => process.exit(await watchBatch(batchId)));
+
+batch
+  .command('cancel <batchId>')
+  .description('Cancel every unfinished job in a batch')
+  .action(async (batchId) => {
+    try {
+      const { data } = await api.delete(`/batches/${batchId}`);
+      console.log(`🛑 Cancelled ${data.data.cancelled}, stopping ${data.data.cancelling}`);
+    } catch (err) {
+      fail('Failed to cancel batch', err);
+    }
+  });
+
+batch
+  .command('list')
+  .description('List recent batches')
+  .action(async () => {
+    try {
+      const { data } = await api.get('/batches');
+      if (json()) return console.log(JSON.stringify(data.data, null, 2));
+      if (!data.data.batches.length) return console.log('No batches.');
+      for (const b of data.data.batches) {
+        console.log(`${BATCH_ICONS[b.status] ?? '•'} ${b.id}  ${b.status.padEnd(9)} ${b.finished}/${b.total}  ${b.name ?? ''}`);
+      }
+    } catch (err) {
+      fail('Failed to list batches', err);
+    }
+  });
+
+program
   .command('health')
   .description('Check engine health')
   .action(async () => {
@@ -251,6 +381,44 @@ program
       fail('Failed to get queue stats', err);
     }
   });
+
+const BATCH_ICONS: Record<string, string> = { queued: '⏳', running: '🔄', completed: '✅', failed: '❌' };
+
+function testLine(t: { total: number; passed: number; failed: number; skipped: number }): string {
+  return `${t.passed}/${t.total} passed` + (t.failed ? `, ${t.failed} failed` : '') + (t.skipped ? `, ${t.skipped} skipped` : '');
+}
+
+function printBatch(b: any) {
+  console.log(`${BATCH_ICONS[b.status] ?? '•'} Batch ${b.id}${b.name ? ` (${b.name})` : ''}: ${b.status}, ${b.finished}/${b.total} finished`);
+  if (b.tests) console.log(`   Tests: ${testLine(b.tests)}`);
+  for (const j of b.jobs) {
+    const label = j.matrix ? Object.entries(j.matrix).map(([k, v]) => `${k}=${v}`).join(' ') : j.language ?? j.command;
+    console.log(`   ${ICONS[j.status] ?? '•'} ${j.jobId}  ${j.status.padEnd(9)} ${label}${j.tests ? `  [${testLine(j.tests)}]` : ''}`);
+  }
+}
+
+async function watchBatch(batchId: string): Promise<number> {
+  let last = -1;
+  for (;;) {
+    try {
+      const { data } = await api.get(`/batches/${batchId}`);
+      const b = data.data;
+      if (b.finished !== last) {
+        console.error(`🔄 [${new Date().toLocaleTimeString()}] ${b.finished}/${b.total} finished`);
+        last = b.finished;
+      }
+      if (b.status === 'completed' || b.status === 'failed') {
+        if (json()) console.log(JSON.stringify(b, null, 2));
+        else printBatch(b);
+        return b.status === 'completed' ? 0 : 1;
+      }
+    } catch (err) {
+      const status = (err as AxiosError).response?.status;
+      if (status === 404 || status === 401 || status === 403) fail('Watch failed', err);
+    }
+    await sleep(1500);
+  }
+}
 
 function readFile(file: string): string {
   const p = path.resolve(file);
@@ -296,6 +464,8 @@ async function watch(jobId: string): Promise<number> {
               (j.duration !== null ? `, ${j.duration}ms` : '') +
               (j.error && j.status !== 'completed' ? `: ${j.error}` : '')
           );
+          if (j.tests) console.error(`🧪 ${testLine(j.tests)}${j.tests.failed ? `  (forge report ${j.jobId})` : ''}`);
+          if (j.artifactCount) console.error(`📦 ${j.artifactCount} artifact(s): forge artifacts ${j.jobId} -o ./artifacts`);
         }
         return EXIT_CODES[j.status];
       }

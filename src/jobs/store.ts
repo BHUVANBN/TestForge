@@ -1,7 +1,7 @@
 import type Redis from 'ioredis';
 import config from '../config';
 import { getRedis, redisKey } from '../queue/redis';
-import { JobOutput, JobRecord, JobStatus } from '../utils/types';
+import { BatchRecord, isTerminal, JobOutput, JobRecord, JobStatus } from '../utils/types';
 
 /**
  * Durable job records in Redis.
@@ -113,6 +113,116 @@ export class JobStore {
     await this.pruneMissing(index, ids, records);
     const matching = records.filter(isRecord).filter((r) => r.status === opts.status);
     return { jobs: matching.slice(start, start + opts.limit), total: matching.length };
+  }
+
+  // ------------------------------------------------------------ finalization
+
+  /** Atomically claim the one-time "job finished" side effects. True only for the first caller. */
+  async claimFinalization(id: string): Promise<boolean> {
+    const res = await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       return redis.call('HSETNX', KEYS[1], 'finalized', 'true')`,
+      1,
+      this.recordKey(id)
+    );
+    return res === 1;
+  }
+
+  // ------------------------------------------------------------ quotas
+
+  private activeKey = (owner: string) => redisKey('quota', 'active', owner);
+  private dailyKey = (owner: string) => redisKey('quota', 'day', owner, new Date().toISOString().slice(0, 10));
+
+  async addActive(owner: string, ids: string[]): Promise<void> {
+    if (!ids.length) return;
+    await this.redis.multi().sadd(this.activeKey(owner), ...ids).expire(this.activeKey(owner), config.jobs.ttlSeconds).exec();
+  }
+
+  async releaseActive(owner: string, id: string): Promise<void> {
+    await this.redis.srem(this.activeKey(owner), id);
+  }
+
+  /** Count queued/running jobs, dropping entries whose job finished or expired (self-healing). */
+  async countActive(owner: string): Promise<number> {
+    const ids = await this.redis.smembers(this.activeKey(owner));
+    if (!ids.length) return 0;
+    const records = await this.getMany(ids);
+    const stale = ids.filter((_, i) => !records[i] || isTerminal(records[i]!.status));
+    if (stale.length) await this.redis.srem(this.activeKey(owner), ...stale);
+    return ids.length - stale.length;
+  }
+
+  /** Reserve `n` submissions against today's quota; returns the new total. */
+  async incrementDaily(owner: string, n: number): Promise<number> {
+    const key = this.dailyKey(owner);
+    const [[, total]] = (await this.redis.multi().incrby(key, n).expire(key, 2 * 24 * 3600).exec()) as [
+      [Error | null, number],
+      unknown,
+    ];
+    return total;
+  }
+
+  async decrementDaily(owner: string, n: number): Promise<void> {
+    await this.redis.decrby(this.dailyKey(owner), n);
+  }
+
+  // ------------------------------------------------------------ batches
+
+  private batchKey = (id: string) => redisKey('batch', id);
+  private batchOwnerIndex = (owner: string) => redisKey('batches', 'owner', owner);
+  private batchAllIndex = () => redisKey('batches', 'all');
+
+  async createBatch(batch: BatchRecord): Promise<void> {
+    const ttl = config.jobs.ttlSeconds;
+    const score = Date.parse(batch.createdAt);
+    const cutoff = Date.now() - ttl * 1000;
+    await this.redis
+      .multi()
+      .hset(this.batchKey(batch.id), encode(batch))
+      .expire(this.batchKey(batch.id), ttl)
+      .zadd(this.batchAllIndex(), score, batch.id)
+      .zadd(this.batchOwnerIndex(batch.owner), score, batch.id)
+      .zremrangebyscore(this.batchAllIndex(), '-inf', cutoff)
+      .zremrangebyscore(this.batchOwnerIndex(batch.owner), '-inf', cutoff)
+      .exec();
+  }
+
+  async getBatch(id: string): Promise<BatchRecord | null> {
+    const raw = await this.redis.hgetall(this.batchKey(id));
+    if (!raw || Object.keys(raw).length === 0) return null;
+    return decode(raw) as unknown as BatchRecord;
+  }
+
+  async updateBatch(id: string, patch: Partial<BatchRecord>): Promise<void> {
+    const set = encode(patch);
+    if (Object.keys(set).length) await this.redis.hset(this.batchKey(id), set);
+  }
+
+  /** Count one more finished job; returns true exactly once, when the last job finishes. */
+  async recordBatchJobFinished(id: string): Promise<boolean> {
+    const res = await this.redis.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+       local done = redis.call('HINCRBY', KEYS[1], 'finished', 1)
+       local total = tonumber(redis.call('HGET', KEYS[1], 'total'))
+       if done == total then return 1 end
+       return 0`,
+      1,
+      this.batchKey(id)
+    );
+    return res === 1;
+  }
+
+  async listBatches(opts: { owner?: string; page: number; limit: number }): Promise<{ batches: BatchRecord[]; total: number }> {
+    const index = opts.owner ? this.batchOwnerIndex(opts.owner) : this.batchAllIndex();
+    const start = (opts.page - 1) * opts.limit;
+    const [ids, total] = await Promise.all([
+      this.redis.zrevrange(index, start, start + opts.limit - 1),
+      this.redis.zcard(index),
+    ]);
+    const batches = await Promise.all(ids.map((id) => this.getBatch(id)));
+    const missing = ids.filter((_, i) => !batches[i]);
+    if (missing.length) await this.redis.zrem(index, ...missing);
+    return { batches: batches.filter((b): b is BatchRecord => !!b), total };
   }
 
   private async pruneMissing(index: string, ids: string[], records: Array<JobRecord | null>) {

@@ -4,8 +4,19 @@ import config from '../config';
 import QueueManager from '../queue/manager';
 import { createLogger } from '../utils/logger';
 import { jobSubmittedCounter } from '../utils/metrics';
-import { isTerminal, JobOutput, JobRecord, JobSpec, JobStatus, JOB_STATUSES, Principal } from '../utils/types';
-import { publishCancel, publishStatus } from './events';
+import {
+  isTerminal,
+  JobOutput,
+  JobRecord,
+  JobSpec,
+  JobStatus,
+  JOB_STATUSES,
+  Principal,
+  PRIORITIES,
+} from '../utils/types';
+import { validateWebhookUrl } from '../webhooks';
+import { publishCancel } from './events';
+import { finalizeJob } from './lifecycle';
 import { isReservedEnvName, LANGUAGES } from './runtimes';
 import { getJobStore, JobStore } from './store';
 
@@ -37,6 +48,8 @@ export function submitSchema(): Joi.ObjectSchema {
     env: Joi.object().pattern(Joi.string(), Joi.string().max(8192)).max(64),
     timeout: Joi.number().integer().min(1000).max(config.workers.maxTimeoutMs).default(config.workers.defaultTimeoutMs),
     retries: Joi.number().integer().min(0).max(config.queue.maxRetries).default(config.queue.defaultRetries),
+    priority: Joi.string().valid(...PRIORITIES).default('normal'),
+    webhookUrl: Joi.string().max(2048),
     metadata: Joi.object().unknown(true),
   })
     .xor('script', 'command')
@@ -70,6 +83,7 @@ export function parseSubmission(body: unknown): JobSpec {
   if (value.metadata !== undefined && Buffer.byteLength(JSON.stringify(value.metadata)) > 8192) {
     problems.push('"metadata" must be at most 8 KiB when serialized');
   }
+  if (value.webhookUrl !== undefined) problems.push(...validateWebhookUrl(value.webhookUrl));
   if (problems.length) throw new JobError(400, 'Validation failed', problems);
 
   return {
@@ -80,9 +94,14 @@ export function parseSubmission(body: unknown): JobSpec {
     env: value.env,
     timeoutMs: value.timeout,
     retries: value.retries,
+    priority: value.priority,
+    webhookUrl: value.webhookUrl,
     metadata: value.metadata,
   };
 }
+
+/** BullMQ: lower number = higher priority. Every job gets one so ordering is consistent. */
+const BULL_PRIORITY = { high: 1, normal: 2, low: 3 } as const;
 
 export class JobService {
   constructor(
@@ -98,30 +117,71 @@ export class JobService {
     return this.queueOverride ?? QueueManager.getInstance();
   }
 
-  async submit(spec: JobSpec, principal: Principal, retryOf?: string): Promise<JobRecord> {
+  /**
+   * Enforce per-key quotas for `n` new jobs. Admins are exempt. Reserves the
+   * daily allowance up front; the returned function gives it back on failure.
+   */
+  async reserveQuota(principal: Principal, n: number): Promise<() => Promise<void>> {
+    const noop = async () => undefined;
+    if (principal.admin) return noop;
+    const { maxActiveJobs, maxJobsPerDay } = config.quotas;
+    if (maxActiveJobs > 0) {
+      const active = await this.store.countActive(principal.id);
+      if (active + n > maxActiveJobs) {
+        throw new JobError(429, 'Quota exceeded', [
+          `at most ${maxActiveJobs} queued or running jobs per API key (currently ${active}, requested ${n})`,
+        ]);
+      }
+    }
+    if (maxJobsPerDay > 0) {
+      const total = await this.store.incrementDaily(principal.id, n);
+      if (total > maxJobsPerDay) {
+        await this.store.decrementDaily(principal.id, n);
+        throw new JobError(429, 'Quota exceeded', [`at most ${maxJobsPerDay} job submissions per API key per day`]);
+      }
+      return () => this.store.decrementDaily(principal.id, n);
+    }
+    return noop;
+  }
+
+  async submit(
+    spec: JobSpec,
+    principal: Principal,
+    opts: { retryOf?: string; batchId?: string; skipQuota?: boolean; id?: string } = {}
+  ): Promise<JobRecord> {
+    const refund = opts.skipQuota ? async () => undefined : await this.reserveQuota(principal, 1);
     const record: JobRecord = {
       ...spec,
-      id: uuidv4(),
+      id: opts.id ?? uuidv4(),
       owner: principal.id,
       status: 'queued',
       attempt: 0,
       maxAttempts: spec.retries + 1,
       createdAt: new Date().toISOString(),
-      retryOf,
+      retryOf: opts.retryOf,
+      batchId: opts.batchId,
     };
-    await this.store.create(record);
     try {
-      await this.queue.add(record.id, record.maxAttempts);
+      await this.store.create(record);
     } catch (err) {
-      await this.store.update(record.id, {
-        status: 'failed',
-        error: 'Could not enqueue job',
-        finishedAt: new Date().toISOString(),
-      });
+      await refund();
+      throw err;
+    }
+    await this.store.addActive(principal.id, [record.id]);
+    try {
+      await this.queue.add(record.id, record.maxAttempts, BULL_PRIORITY[spec.priority ?? 'normal']);
+    } catch (err) {
+      await finalizeJob(record.id, 'failed', { error: 'Could not enqueue job' }, this.store);
       throw err;
     }
     jobSubmittedCounter.inc();
-    log.info('Job submitted', { jobId: record.id, owner: principal.id, language: record.language, command: record.command });
+    log.info('Job submitted', {
+      jobId: record.id,
+      owner: principal.id,
+      language: record.language,
+      command: record.command,
+      batchId: record.batchId,
+    });
     return record;
   }
 
@@ -181,12 +241,7 @@ export class JobService {
 
     const removed = await this.queue.removeIfPending(id);
     if (removed || !(await this.queue.getJob(id))) {
-      await this.store.update(id, {
-        status: 'cancelled',
-        error: 'Cancelled by user',
-        finishedAt: new Date().toISOString(),
-      });
-      void publishStatus({ jobId: id, owner: record.owner, status: 'cancelled', error: 'Cancelled by user' });
+      await finalizeJob(id, 'cancelled', { error: 'Cancelled by user' }, this.store);
       return 'cancelled';
     }
     // Running: whichever worker holds it will kill it and record the outcome.
@@ -200,18 +255,23 @@ export class JobService {
     if (!isTerminal(record.status) || record.status === 'completed') {
       throw new JobError(409, 'Only failed, timed-out or cancelled jobs can be retried');
     }
-    const spec: JobSpec = {
-      language: record.language,
-      script: record.script,
-      command: record.command,
-      args: record.args,
-      env: record.env,
-      timeoutMs: record.timeoutMs,
-      retries: record.retries,
-      metadata: record.metadata,
-    };
-    return this.submit(spec, principal, record.id);
+    return this.submit(specOf(record), principal, { retryOf: record.id });
   }
+}
+
+export function specOf(record: JobRecord): JobSpec {
+  return {
+    language: record.language,
+    script: record.script,
+    command: record.command,
+    args: record.args,
+    env: record.env,
+    timeoutMs: record.timeoutMs,
+    retries: record.retries,
+    priority: record.priority,
+    webhookUrl: record.webhookUrl,
+    metadata: record.metadata,
+  };
 }
 
 /** Public, list-friendly view of a job (no script body or env values). */
@@ -221,6 +281,7 @@ export function summarize(r: JobRecord) {
     status: r.status,
     language: r.language,
     command: r.command,
+    priority: r.priority ?? 'normal',
     attempt: r.attempt,
     maxAttempts: r.maxAttempts,
     timeout: r.timeoutMs,
@@ -231,6 +292,11 @@ export function summarize(r: JobRecord) {
     startedAt: r.startedAt,
     completedAt: r.finishedAt,
     retryOf: r.retryOf,
+    batchId: r.batchId,
+    tests: r.testReport
+      ? { total: r.testReport.total, passed: r.testReport.passed, failed: r.testReport.failed, skipped: r.testReport.skipped }
+      : undefined,
+    artifactCount: r.artifactCount ?? 0,
     metadata: r.metadata,
   };
 }
@@ -242,7 +308,10 @@ export function detail(r: JobRecord) {
     script: r.script,
     args: r.args,
     envKeys: Object.keys(r.env ?? {}),
+    webhookUrl: r.webhookUrl,
+    testReport: r.testReport,
     outputTruncated: r.outputTruncated ?? false,
+    artifactsTruncated: r.artifactsTruncated ?? false,
     workerId: r.workerId,
   };
 }

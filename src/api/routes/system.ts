@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import os from 'os';
 import config from '../../config';
-import { publishStatus } from '../../jobs/events';
+import { finalizeJob } from '../../jobs/lifecycle';
 import { getJobStore, JobStore } from '../../jobs/store';
 import QueueManager from '../../queue/manager';
 import { redisHealthy } from '../../queue/redis';
@@ -183,16 +183,11 @@ export function createSystemRouter(deps: SystemDeps = {}): Router {
     requireAdmin,
     asyncHandler(async (req, res) => {
       const removed = await d.queue().removePending();
-      const now = new Date().toISOString();
       const store = d.store();
-      const records = await store.getMany(removed);
-      await Promise.all(
-        records.map(async (r) => {
-          if (!r) return;
-          await store.update(r.id, { status: 'cancelled', cancelRequested: true, error: 'Removed by administrator', finishedAt: now });
-          void publishStatus({ jobId: r.id, owner: r.owner, status: 'cancelled', error: 'Removed by administrator' });
-        })
-      );
+      for (const id of removed) {
+        await store.update(id, { cancelRequested: true });
+        await finalizeJob(id, 'cancelled', { error: 'Removed by administrator' }, store);
+      }
       log.warn('Queue cleared', { by: req.principal?.id, removed: removed.length });
       res.json({ success: true, data: { removed: removed.length }, message: `Removed ${removed.length} pending job(s)` });
     })

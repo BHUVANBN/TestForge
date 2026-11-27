@@ -30,13 +30,14 @@ export class QueueManager {
     QueueManager.instance = manager;
   }
 
-  async add(jobId: string, attempts: number): Promise<Job<QueuePayload>> {
+  async add(jobId: string, attempts: number, priority = 2): Promise<Job<QueuePayload>> {
     return this.queue.add(
       'execute-test',
       { jobId },
       {
         jobId,
         attempts,
+        priority,
         backoff: { type: 'exponential', delay: config.queue.backoffDelayMs },
       }
     );
@@ -66,11 +67,12 @@ export class QueueManager {
 
   async getStats(): Promise<QueueStats> {
     const [counts, paused] = await Promise.all([
-      this.queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
+      this.queue.getJobCounts('waiting', 'prioritized', 'active', 'completed', 'failed', 'delayed'),
       this.queue.isPaused(),
     ]);
     return {
-      waiting: counts.waiting ?? 0,
+      // Every job carries a priority, so BullMQ keeps waiting jobs in "prioritized".
+      waiting: (counts.waiting ?? 0) + (counts.prioritized ?? 0),
       active: counts.active ?? 0,
       completed: counts.completed ?? 0,
       failed: counts.failed ?? 0,

@@ -20,8 +20,14 @@ export const TERMINAL_STATUSES: ReadonlySet<JobStatus> = new Set([
 
 export const isTerminal = (status: JobStatus): boolean => TERMINAL_STATUSES.has(status);
 
+export const PRIORITIES = ['high', 'normal', 'low'] as const;
+export type Priority = (typeof PRIORITIES)[number];
+
 /** What the user asked to run. Stored with the job so it can be retried. */
 export interface JobSpec {
+  priority?: Priority;
+  /** Called (POST) when the job reaches a terminal state. */
+  webhookUrl?: string;
   language?: Language;
   script?: string;
   command?: string;
@@ -49,6 +55,50 @@ export interface JobRecord extends JobSpec {
   retryOf?: string;
   cancelRequested?: boolean;
   outputTruncated?: boolean;
+  batchId?: string;
+  testReport?: TestReport;
+  artifactCount?: number;
+  artifactsTruncated?: boolean;
+}
+
+export interface TestFailure {
+  name: string;
+  classname?: string;
+  message?: string;
+}
+
+/** Parsed JUnit XML / TAP results. */
+export interface TestReport {
+  format: 'junit' | 'tap';
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  durationMs?: number;
+  failures: TestFailure[];
+  sources: string[];
+}
+
+export interface Artifact {
+  name: string;
+  data: Buffer;
+}
+
+export interface ArtifactMeta {
+  name: string;
+  size: number;
+}
+
+export interface BatchRecord {
+  id: string;
+  owner: string;
+  name?: string;
+  jobIds: string[];
+  total: number;
+  finished: number;
+  webhookUrl?: string;
+  createdAt: string;
+  finishedAt?: string;
 }
 
 export interface JobOutput {
@@ -66,6 +116,8 @@ export type ExecutionOutcome = 'completed' | 'failed' | 'timeout' | 'cancelled' 
 
 export interface ExecutionResult {
   outcome: ExecutionOutcome;
+  artifacts?: Artifact[];
+  artifactsTruncated?: boolean;
   exitCode: number | null;
   stdout: string;
   stderr: string;

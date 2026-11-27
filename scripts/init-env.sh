@@ -23,10 +23,12 @@ API_KEYS=${USER_KEY}
 ADMIN_API_KEYS=${ADMIN_KEY}
 DOCKER_GID=${DOCKER_GID}
 GRAFANA_PASSWORD=$(rand)
+WEBHOOK_SECRET=$(rand)
 WORKER_CONCURRENCY=4
 EOF
 
 echo "Wrote .env (mode 600)."
 echo "  User API key:  ${USER_KEY}"
 echo "  Admin API key: ${ADMIN_KEY}"
+echo "  Webhook signing secret is in .env (WEBHOOK_SECRET)."
 echo "Start with: docker compose up -d --build"

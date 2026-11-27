@@ -14,13 +14,21 @@ import { VERSION } from '../version';
 import { apiKeyAuth } from './middleware/auth';
 import { attachRealtime } from './realtime';
 import { createJobsRouter } from './routes/jobs';
+import { createBatchesRouter } from './routes/batches';
+import { RedisRateLimitStore } from './rateLimitStore';
+import { BatchService } from '../jobs/batches';
+import { ArtifactStore } from '../jobs/artifacts';
 import { createHealthRouter, createSystemRouter, SystemDeps } from './routes/system';
 
 const log = createLogger('api');
 
 export interface AppOptions {
   jobs?: JobService;
+  batches?: BatchService;
+  artifacts?: ArtifactStore;
   system?: SystemDeps;
+  /** Override the rate-limit store (tests). */
+  rateLimitStore?: 'redis' | 'memory';
 }
 
 const clientKey = (req: Request): string => req.principal?.id ?? req.ip ?? 'unknown';
@@ -86,8 +94,13 @@ export function createApp(opts: AppOptions = {}): express.Application {
   api.use(createHealthRouter(opts.system));
   api.use(express.json({ limit: config.server.bodyLimit }));
   api.use(apiKeyAuth);
+  const storeKind = opts.rateLimitStore ?? config.server.rateLimit.store;
+  const store = (prefix: string) => (storeKind === 'redis' ? { store: new RedisRateLimitStore(prefix) } : {});
   api.use(
     rateLimit({
+      ...store('api'),
+      // If Redis is briefly unavailable, serve requests rather than fail closed.
+      passOnStoreError: true,
       windowMs: config.server.rateLimit.windowMs,
       limit: config.server.rateLimit.max,
       keyGenerator: clientKey,
@@ -97,6 +110,8 @@ export function createApp(opts: AppOptions = {}): express.Application {
     })
   );
   const submitLimiter = rateLimit({
+    ...store('submit'),
+    passOnStoreError: true,
     windowMs: config.server.rateLimit.windowMs,
     limit: config.server.rateLimit.submitMax,
     keyGenerator: clientKey,
@@ -104,7 +119,8 @@ export function createApp(opts: AppOptions = {}): express.Application {
     legacyHeaders: false,
     message: { success: false, error: 'Too many submissions', message: 'Job submission rate limit exceeded' },
   });
-  api.use(createJobsRouter({ service: opts.jobs, submitLimiter }));
+  api.use(createJobsRouter({ service: opts.jobs, submitLimiter, artifacts: opts.artifacts }));
+  api.use(createBatchesRouter({ service: opts.batches, submitLimiter }));
   api.use(createSystemRouter(opts.system));
   app.use('/api/v1', api);
 

@@ -1,5 +1,7 @@
+import { randomBytes } from 'crypto';
 import Docker from 'dockerode';
 import os from 'os';
+import { PassThrough } from 'stream';
 import config from '../config';
 import { languageForCommand, RUNTIMES } from '../jobs/runtimes';
 import { createJobLogger, createLogger } from '../utils/logger';
@@ -13,9 +15,75 @@ import {
 } from '../utils/types';
 import { jobEnvironment, OUTCOME_FOR_KILL } from './executor';
 import { OutputCollector } from './output';
+import { extractTar, readStreamCapped } from './artifacts';
 
 const WORKDIR = '/workspace';
+const ARTIFACTS_DIR = `${WORKDIR}/artifacts`;
 const SCRIPT_ENV = 'TESTFORGE_SCRIPT';
+
+/**
+ * Container entrypoint. Runs the job as a child so SIGTERM is forwarded, then
+ * prints a random completion marker and stays alive briefly so the worker can
+ * read /workspace/artifacts from the tmpfs (which vanishes once the container
+ * stops). On cancel/timeout it exits immediately instead.
+ * $0 is the marker; in script mode $1 is the script path.
+ */
+const WRAPPER_PRELUDE = `mkdir -p "$TESTFORGE_ARTIFACTS" || exit 125`;
+const WRAPPER_SCRIPT = `printf '%s' "$${SCRIPT_ENV}" > "$1" || exit 125; unset ${SCRIPT_ENV}; shift`;
+const WRAPPER_RUN = [
+  `"$@" </dev/null &`,
+  `p=$!`,
+  `trap 'k=1; kill -TERM "$p" 2>/dev/null' TERM INT`,
+  `wait "$p"; c=$?`,
+  `while kill -0 "$p" 2>/dev/null; do wait "$p"; c=$?; done`,
+  `[ -n "\${k:-}" ] && exit "$c"`,
+  // Reap anything the job left running (kill -1 spares this shell and init).
+  `kill -KILL -1 2>/dev/null`,
+  `printf '\\n%s:%s\\n' "$0" "$c"`,
+  `exec sleep 600`,
+].join('\n');
+
+/**
+ * Passes stdout through while watching for the completion marker. Holds back
+ * a short tail so the marker itself never reaches the job's recorded output.
+ */
+export class MarkerFilter {
+  private pending = Buffer.alloc(0);
+  private finished = false;
+  private readonly pattern: RegExp;
+  private readonly holdback: number;
+
+  constructor(
+    marker: string,
+    private readonly forward: (chunk: Buffer) => void,
+    private readonly onMarker: (exitCode: number) => void
+  ) {
+    this.pattern = new RegExp(`\\n${marker}:(\\d+)\\n`);
+    this.holdback = marker.length + 8;
+  }
+
+  push(chunk: Buffer): void {
+    if (this.finished) return;
+    this.pending = Buffer.concat([this.pending, chunk]);
+    const m = this.pending.toString('latin1').match(this.pattern);
+    if (m && m.index !== undefined) {
+      this.finished = true;
+      if (m.index > 0) this.forward(this.pending.subarray(0, m.index));
+      this.pending = Buffer.alloc(0);
+      this.onMarker(Number(m[1]));
+      return;
+    }
+    if (this.pending.length > this.holdback) {
+      this.forward(this.pending.subarray(0, this.pending.length - this.holdback));
+      this.pending = this.pending.subarray(this.pending.length - this.holdback);
+    }
+  }
+
+  flush(): void {
+    if (!this.finished && this.pending.length) this.forward(this.pending);
+    this.pending = Buffer.alloc(0);
+  }
+}
 export const MANAGED_LABEL = 'testforge.managed';
 export const WORKER_LABEL = 'testforge.worker';
 export const JOB_LABEL = 'testforge.job';
@@ -52,35 +120,30 @@ export class DockerExecutor implements Executor {
     return config.docker.images[language];
   }
 
-  command(): string[] {
+  /** Container argv. `marker` must be unpredictable to the job. */
+  command(marker: string): string[] {
     if (this.record.script !== undefined) {
       const runtime = RUNTIMES[this.record.language ?? 'bash'];
       const file = `${WORKDIR}/${runtime.fileName}`;
-      // The script arrives via an env var (no bind mounts / archive uploads needed),
-      // is written to the tmpfs workspace, removed from the environment, then exec'd.
-      return [
-        'sh',
-        '-c',
-        `printf '%s' "$${SCRIPT_ENV}" > "$1" && unset ${SCRIPT_ENV} && shift && exec "$@"`,
-        'testforge',
-        file,
-        ...runtime.interpreter,
-        file,
-      ];
+      // The script arrives via an env var (no bind mounts needed) and is
+      // written to the tmpfs workspace before running.
+      const body = [WRAPPER_PRELUDE, WRAPPER_SCRIPT, WRAPPER_RUN].join('\n');
+      return ['sh', '-c', body, marker, file, ...runtime.interpreter, file];
     }
     if (!this.record.command) throw new Error('Job has neither a script nor a command');
-    return [this.record.command, ...(this.record.args ?? [])];
+    const body = [WRAPPER_PRELUDE, WRAPPER_RUN].join('\n');
+    return ['sh', '-c', body, marker, this.record.command, ...(this.record.args ?? [])];
   }
 
-  containerOptions(): Docker.ContainerCreateOptions {
+  containerOptions(marker = newMarker()): Docker.ContainerCreateOptions {
     const memory = config.docker.memoryMB * 1024 * 1024;
     const tmpfs = `rw,exec,nosuid,nodev,size=${config.docker.tmpfsSizeMB}m,mode=1777`;
-    const env = Object.entries(jobEnvironment(this.record, WORKDIR)).map(([k, v]) => `${k}=${v}`);
+    const env = Object.entries(jobEnvironment(this.record, WORKDIR, ARTIFACTS_DIR)).map(([k, v]) => `${k}=${v}`);
     if (this.record.script !== undefined) env.push(`${SCRIPT_ENV}=${this.record.script}`);
 
     return {
       Image: this.image(),
-      Cmd: this.command(),
+      Cmd: this.command(marker),
       Env: env,
       WorkingDir: WORKDIR,
       User: config.docker.user,
@@ -121,9 +184,14 @@ export class DockerExecutor implements Executor {
       const image = this.image();
       await ensureImage(this.docker, image);
 
-      const container = await this.docker.createContainer(this.containerOptions());
+      const marker = newMarker();
+      const container = await this.docker.createContainer(this.containerOptions(marker));
       this.container = container;
       if (this.killReason) return this.result(output, started, null);
+
+      let markerSeen: (code: number) => void = () => undefined;
+      const finished = new Promise<number>((resolve) => (markerSeen = resolve));
+      const stdout = new MarkerFilter(marker, (chunk) => output.push('stdout', chunk), (code) => markerSeen(code));
 
       const stream = await container.attach({ stream: true, stdout: true, stderr: true });
       const streamEnded = new Promise<void>((resolve) => {
@@ -133,7 +201,7 @@ export class DockerExecutor implements Executor {
       });
       container.modem.demuxStream(
         stream,
-        { write: (chunk: Buffer) => output.push('stdout', chunk) } as unknown as NodeJS.WritableStream,
+        { write: (chunk: Buffer) => stdout.push(chunk) } as unknown as NodeJS.WritableStream,
         { write: (chunk: Buffer) => output.push('stderr', chunk) } as unknown as NodeJS.WritableStream
       );
 
@@ -143,11 +211,27 @@ export class DockerExecutor implements Executor {
       this.log.info('Container started', { image, container: container.id.slice(0, 12) });
       timer = setTimeout(() => void this.kill('timeout'), this.record.timeoutMs);
 
-      const { StatusCode } = (await container.wait()) as { StatusCode: number };
+      const end = await Promise.race([
+        finished.then((code) => ({ via: 'marker' as const, code })),
+        container.wait().then((r: { StatusCode: number }) => ({ via: 'exit' as const, code: r.StatusCode })),
+      ]);
       clearTimeout(timer);
-      await Promise.race([streamEnded, delay(1000)]);
+      const durationMs = Date.now() - started;
+
+      let artifacts: Awaited<ReturnType<typeof this.collectArtifacts>> = { artifacts: [], truncated: false };
+      if (end.via === 'marker') {
+        artifacts = await this.collectArtifacts(container);
+        await container.kill().catch(() => undefined);
+      } else {
+        await Promise.race([streamEnded, delay(1000)]);
+        stdout.flush();
+      }
       output.finish();
-      return this.result(output, started, StatusCode);
+      return {
+        ...this.result(output, Date.now() - durationMs, end.code),
+        artifacts: artifacts.artifacts,
+        artifactsTruncated: artifacts.truncated,
+      };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error('Docker execution failed', { error: message });
@@ -155,6 +239,42 @@ export class DockerExecutor implements Executor {
     } finally {
       if (timer) clearTimeout(timer);
       await this.remove();
+    }
+  }
+
+  /**
+   * Copy /workspace/artifacts out of the still-running container. Docker's
+   * archive API can't see tmpfs mounts, so run `tar` inside the container
+   * (same mount namespace, same unprivileged user). Requires tar in the image
+   * (all default Alpine-based runtimes have it).
+   */
+  private async collectArtifacts(container: Docker.Container) {
+    const limits = config.artifacts;
+    if (limits.maxFiles === 0 || limits.maxBytes === 0) return { artifacts: [], truncated: false };
+    try {
+      const exec = await container.exec({
+        Cmd: ['tar', '-cf', '-', '-C', ARTIFACTS_DIR, '.'],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const stream = await exec.start({ hijack: true, stdin: false });
+      const tarOut = new PassThrough();
+      container.modem.demuxStream(stream, tarOut, new PassThrough());
+      stream.on('end', () => tarOut.end());
+      stream.on('close', () => tarOut.end());
+      stream.on('error', (e: Error) => tarOut.destroy(e));
+      // tar adds 512-byte headers + padding per file.
+      const capped = readStreamCapped(tarOut, limits.maxBytes + (limits.maxFiles + 2) * 1536);
+      const timeout = delay(30_000).then(() => {
+        throw new Error('timed out reading artifacts');
+      });
+      const { data, truncated } = await Promise.race([capped, timeout]);
+      (stream as any).destroy?.();
+      const res = extractTar(data, limits, './');
+      return { artifacts: res.artifacts, truncated: res.truncated || truncated };
+    } catch (err: any) {
+      this.log.warn('Could not collect artifacts', { error: err?.message });
+      return { artifacts: [], truncated: false };
     }
   }
 
@@ -212,6 +332,7 @@ export class DockerExecutor implements Executor {
 }
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const newMarker = () => `__TESTFORGE_DONE_${randomBytes(12).toString('hex')}__`;
 const pulling = new Map<string, Promise<void>>();
 
 export async function ensureImage(docker: Docker, image: string): Promise<void> {

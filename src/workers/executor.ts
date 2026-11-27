@@ -13,6 +13,7 @@ import {
   OutputListener,
 } from '../utils/types';
 import { OutputCollector } from './output';
+import { collectFromDirectory } from './artifacts';
 
 export const OUTCOME_FOR_KILL: Record<KillReason, ExecutionOutcome> = {
   cancel: 'cancelled',
@@ -30,9 +31,10 @@ export function buildArgv(record: JobRecord, scriptPath: string): string[] {
   return [record.command, ...(record.args ?? [])];
 }
 
-export function jobEnvironment(record: JobRecord, home: string): Record<string, string> {
+export function jobEnvironment(record: JobRecord, home: string, artifactsDir: string): Record<string, string> {
   return {
     HOME: home,
+    TESTFORGE_ARTIFACTS: artifactsDir,
     TMPDIR: home,
     LANG: 'C.UTF-8',
     CI: 'true',
@@ -75,8 +77,13 @@ export class LocalExecutor implements Executor {
         await fs.writeFile(scriptPath, this.record.script, { mode: 0o600 });
       }
       const argv = buildArgv(this.record, scriptPath);
+      const artifactsDir = path.join(workDir, 'artifacts');
+      await fs.mkdir(artifactsDir);
       if (this.killReason) return this.result(output, started, null, null);
-      return await this.spawnAndWait(argv, workDir, output, started);
+      const result = await this.spawnAndWait(argv, workDir, output, started);
+      if (result.outcome === 'interrupted') return result;
+      const collected = await collectFromDirectory(artifactsDir, config.artifacts);
+      return { ...result, artifacts: collected.artifacts, artifactsTruncated: collected.truncated };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error('Local execution failed', { error: message });
@@ -96,7 +103,10 @@ export class LocalExecutor implements Executor {
       const [cmd, ...args] = argv;
       this.log.info('Spawning process', { cmd, args: args.length });
 
-      const env = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', ...jobEnvironment(this.record, workDir) };
+      const env = {
+        PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+        ...jobEnvironment(this.record, workDir, path.join(workDir, 'artifacts')),
+      };
       const child = spawn(cmd, args, {
         cwd: workDir,
         env,

@@ -1,13 +1,17 @@
 import { NextFunction, Request, RequestHandler, Response, Router } from 'express';
 import { detail, getJobService, JobError, JobService, parseSubmission, summarize } from '../../jobs/service';
 import { asyncHandler } from '../util';
+import { ArtifactStore, getArtifactStore } from '../../jobs/artifacts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function createJobsRouter(opts: { service?: JobService; submitLimiter?: RequestHandler } = {}): Router {
+export function createJobsRouter(
+  opts: { service?: JobService; submitLimiter?: RequestHandler; artifacts?: ArtifactStore } = {}
+): Router {
   const router = Router();
   const svc = () => opts.service ?? getJobService();
   const limit: RequestHandler = opts.submitLimiter ?? ((_req, _res, next) => next());
+  const artifacts = () => opts.artifacts ?? getArtifactStore();
 
   router.param('jobId', (req: Request, res: Response, next: NextFunction, id: string) => {
     if (!UUID.test(id)) {
@@ -89,6 +93,51 @@ export function createJobsRouter(opts: { service?: JobService; submitLimiter?: R
     asyncHandler(async (req, res) => {
       const { record, output } = await svc().getOutput(req.params.jobId, req.principal!);
       res.json({ success: true, data: { ...detail(record), output } });
+    })
+  );
+
+  router.get(
+    '/jobs/:jobId/report',
+    asyncHandler(async (req, res) => {
+      const record = await svc().get(req.params.jobId, req.principal!);
+      res.json({ success: true, data: record.testReport ?? null });
+    })
+  );
+
+  router.get(
+    '/jobs/:jobId/artifacts',
+    asyncHandler(async (req, res) => {
+      const record = await svc().get(req.params.jobId, req.principal!);
+      res.json({
+        success: true,
+        data: { artifacts: await artifacts().list(record.id), truncated: record.artifactsTruncated ?? false },
+      });
+    })
+  );
+
+  // Artifact names may contain slashes, so match the rest of the path.
+  router.get(
+    /^\/jobs\/([0-9a-f-]{36})\/artifacts\/(.+)$/i,
+    asyncHandler(async (req, res) => {
+      const jobId = req.params[0];
+      const name = req.params[1]; // already URL-decoded by Express
+      const record = await svc().get(jobId, req.principal!);
+      const file = await artifacts().get(record.id, name);
+      if (!file) {
+        res.status(404).json({ success: false, error: 'Artifact not found' });
+        return;
+      }
+      const filename = (name.split('/').pop() || 'artifact').replace(/[^\w.-]/g, '_');
+      // Always a download, never rendered: artifacts are untrusted job output.
+      res
+        .status(200)
+        .set({
+          'Content-Type': 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Content-Length': String(file.data.length),
+          'Cache-Control': 'private, no-store',
+        })
+        .end(file.data);
     })
   );
 

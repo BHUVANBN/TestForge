@@ -5,6 +5,10 @@ import { randomUUID } from 'crypto';
 import config from '../config';
 import { channels, CancelEvent, publishLog, publishStatus } from '../jobs/events';
 import { getJobStore, JobStore } from '../jobs/store';
+import { ArtifactStore, getArtifactStore } from '../jobs/artifacts';
+import { finalizeJob } from '../jobs/lifecycle';
+import { buildReport } from '../jobs/report';
+import { startWebhookWorker, WebhookDelivery } from '../webhooks';
 import { createRedis, getRedis, redisKey } from '../queue/redis';
 import { createLogger } from '../utils/logger';
 import {
@@ -33,11 +37,16 @@ export interface WorkerManagerOptions {
   connect?: (name: string) => Redis;
   /** Skip Docker orphan cleanup (tests). */
   skipOrphanCleanup?: boolean;
+  artifacts?: ArtifactStore;
+  /** Run the webhook delivery worker in this process (default: when startWorker). */
+  deliverWebhooks?: boolean;
 }
 
 export class WorkerManager {
   readonly id = `${os.hostname()}-${process.pid}-${randomUUID().slice(0, 8)}`;
   private worker: Worker<QueuePayload> | null = null;
+  private webhookWorker: Worker<WebhookDelivery> | null = null;
+  private readonly artifacts: ArtifactStore;
   private subscriber: Redis | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private readonly active = new Map<string, Executor>();
@@ -50,6 +59,7 @@ export class WorkerManager {
   constructor(private readonly opts: WorkerManagerOptions = {}) {
     this.store = opts.store ?? getJobStore();
     this.executorFactory = opts.executorFactory ?? defaultExecutorFactory;
+    this.artifacts = opts.artifacts ?? getArtifactStore();
   }
 
   async start(): Promise<void> {
@@ -89,6 +99,9 @@ export class WorkerManager {
       this.worker.on('error', (err) => log.error('Worker error', { error: err.message }));
       this.worker.on('stalled', (jobId) => log.warn('Job stalled; it will be re-queued', { jobId }));
     }
+    if (this.opts.deliverWebhooks ?? this.opts.startWorker !== false) {
+      this.webhookWorker = startWebhookWorker(connect);
+    }
 
     await this.heartbeat();
     this.heartbeatTimer = setInterval(() => void this.heartbeat(), config.workers.heartbeatIntervalMs);
@@ -116,8 +129,9 @@ export class WorkerManager {
 
     // BullMQ increments attemptsMade when the job becomes active, so it is the
     // 1-based number of the attempt now running (and matches its retry rule).
-    const attempt = Math.max(1, job.attemptsMade);
+    // A re-run after a worker shutdown also counts, so clamp for display.
     const maxAttempts = job.opts.attempts ?? record.maxAttempts ?? 1;
+    const attempt = Math.min(Math.max(1, job.attemptsMade), maxAttempts);
     const startedAt = new Date().toISOString();
     await this.store.update(jobId, {
       status: 'running',
@@ -163,6 +177,9 @@ export class WorkerManager {
     }
 
     await this.store.saveOutput(jobId, { stdout: result.stdout, stderr: result.stderr, truncated: result.truncated });
+    const artifacts = result.artifacts ?? [];
+    if (artifacts.length) await this.artifacts.save(jobId, artifacts);
+    const testReport = buildReport({ stdout: result.stdout, artifacts });
 
     // A cancel may have raced with normal completion.
     const latest = await this.store.get(jobId);
@@ -177,6 +194,9 @@ export class WorkerManager {
       durationMs: result.durationMs,
       error: outcome === 'cancelled' ? 'Cancelled by user' : result.error,
       outputTruncated: result.truncated,
+      artifactCount: artifacts.length,
+      artifactsTruncated: result.artifactsTruncated ?? false,
+      testReport,
     };
 
     if (outcome === 'completed') {
@@ -205,15 +225,7 @@ export class WorkerManager {
     status: 'completed' | 'failed' | 'timeout' | 'cancelled',
     details: Partial<JobRecord>
   ): Promise<void> {
-    await this.store.update(record.id, { status, finishedAt: new Date().toISOString(), ...details });
-    void publishStatus({
-      jobId: record.id,
-      owner: record.owner,
-      status,
-      exitCode: details.exitCode,
-      error: details.error,
-      durationMs: details.durationMs,
-    });
+    await finalizeJob(record.id, status, details, this.store);
     log.info('Job finished', { jobId: record.id, status, exitCode: details.exitCode, durationMs: details.durationMs });
   }
 
@@ -283,6 +295,7 @@ export class WorkerManager {
       await Promise.all([...this.active.values()].map((e) => e.kill('shutdown')));
     }
 
+    await this.webhookWorker?.close().catch(() => undefined);
     await getRedis().del(redisKey('worker', this.id)).catch(() => undefined);
     await this.subscriber?.quit().catch(() => undefined);
     log.info('Worker stopped');
